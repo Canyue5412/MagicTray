@@ -1,0 +1,27 @@
+# Local configuration, credentials and runtime state
+*.ini
+*.ini.*
+logs/
+*.log
+*.tmp
+.env
+.env.*
+
+# Local dependencies, diagnostics and generated artifacts
+packages/
+_tooltest/
+_publish/
+__pycache__/
+*.pyc
+*.pdb
+*.build.exe
+*.previous.exe
+*.original
+*.bak
+bin/
+obj/
+.vs/
+
+# Only the current distributable belongs in version control
+*.exe
+!Magic5Tray.exe
