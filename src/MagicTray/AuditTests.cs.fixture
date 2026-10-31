@@ -64,6 +64,7 @@ internal static class AuditTests
                     List<string> messages = new List<string>(); e.Message += delegate(string m) { messages.Add(m); Console.WriteLine(m); };
                     bool failed = false; try { e.Backup(c); } catch { failed = true; }
                     Check(failed && e.LastUploaded == 2 && e.LastPending == 1, "partial FTP refusal reports two confirmed uploads and one pending file");
+                    Check(e.LastBackupElapsedSeconds >= 0 && e.LastBackup.Contains("总耗时"), "partially failed backup retains elapsed duration");
                     Check(e.LastProvisional == 0, "password equal to JSON object key cannot corrupt per-file success parsing");
                     string manifest = Directory.GetFiles(e.LogDir, "backup-manifest-*.json")[0], recorded = File.ReadAllText(manifest);
                     Check(recorded.Contains("good.txt") && recorded.Contains("report.partial") && !recorded.Contains("remote-error.txt"), "partial results persist only confirmed uploads");

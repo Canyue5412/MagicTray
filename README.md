@@ -1,8 +1,14 @@
-# MagicTray 2.2.1
+# MagicTray 2.2.2
 
 一个本地运行的 Windows 手机 FTP 网盘与备份工具，使用 C# / WinForms / .NET Framework 构建。
 
 **AI 制作声明：本项目由 DeepSeek 与 OpenAI Codex 协作制作和完善，用户主导需求、测试与验收。** 程序不依赖 AI API。
+
+## 2.2.2 日常使用改进
+
+- “详细信息”页顶部可打开日志文件夹，方便查看历史故障。
+- “复制脱敏诊断摘要”只复制版本、运行时、依赖是否找到、完整性及操作状态等白名单信息，不含 IP、账号、密码、文件路径或原始日志；不会发起 FTP 测试或保存配置。原始日志仍可能包含连接信息和文件路径，分享前应自行检查。
+- 传输页每秒显示本轮已耗时，包含本地摘要扫描和等待服务器的时间。成功、部分完成、失败和停止均保留总耗时，最近结果重启后仍可查看。
 
 ## 2.2 修复：文件已到手机却显示“备份失败”
 
@@ -41,7 +47,7 @@
 
 ### 详细信息
 
-查看使用与备份规则、依赖的官方下载链接、隐私与 AI 制作说明，按需展开运行日志。
+打开日志文件夹、复制脱敏诊断摘要，或查看使用与备份规则、依赖下载、隐私与 AI 制作说明。按需展开运行日志。
 
 ![详细信息页：合成示例数据](docs/ui-details.png)
 
@@ -101,13 +107,13 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\src\MagicTray\build.ps1
 
 脚本使用 Windows 自带 .NET Framework C# 编译器，无需 NuGet。先关闭正在运行的 MagicTray 窗口；若需保留挂载，退出时选择保留。构建先生成临时 exe，再发布为根目录 `MagicTray.exe`；失败时保留原成品。脚本只设置新生成 exe 的普通 Medium 完整性标签，不修改文件夹权限、UAC 或系统设置，通常无需管理员权限。
 
-源码按职责划分：`MagicTray.cs` 是启动入口，`MainForm.cs` 构建三个页面并处理界面交互，`SkippedItemsForm.cs` 展示跳过报告，`Settings.cs` 管理配置，`Engine.cs` 负责挂载和备份。
+源码按职责划分：`MagicTray.cs` 是启动入口，`MainForm.cs` 构建三个页面并处理界面交互，`SkippedItemsForm.cs` 展示跳过报告，`Settings.cs` 管理配置，`Engine.cs` 负责挂载和备份，`AppDiagnostics.cs` 按白名单生成本地诊断摘要。
 
 命令行支持 `--check`（结果写入 `logs/check.log`）、`--mount` 与 `--unmount`，均使用同目录配置；不传参数打开完整界面。
 
 ## 验证与仓库内容
 
-历史 2.2 测试包含本机模拟 FTP、故障注入、权限跳过、并发配置及合成 UI 检查；小文件性能对照也只使用生成数据，不能代表真实手机速度。2.2.1 的本轮验证与适用范围见 [版本记录](docs/changelog.md)，可复现命令见 [测试指南](docs/testing.md)。
+历史 2.2 测试包含本机模拟 FTP、故障注入、权限跳过、并发配置及合成 UI 检查；小文件性能对照也只使用生成数据，不能代表真实手机速度。2.2.2 的本轮验证与适用范围见 [版本记录](docs/changelog.md)，可复现命令见 [测试指南](docs/testing.md)。
 
 [GitHub 项目](https://github.com/Canyue5412/MagicTray) · [发布下载](https://github.com/Canyue5412/MagicTray/releases)
 

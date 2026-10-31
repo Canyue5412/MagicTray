@@ -29,6 +29,7 @@ namespace MagicTray
         public int LastUploaded { get; private set; }
         public int LastPending { get; private set; }
         public int LastProvisional { get; private set; }
+        public double LastBackupElapsedSeconds { get; private set; }
         public int SkippedCount { get; private set; }
         public string SkippedReportPath { get { return Path.Combine(LogDir, "backup-skipped.txt"); } }
         private readonly List<string> skipped = new List<string>();
@@ -42,6 +43,7 @@ namespace MagicTray
         private string StateFile { get { return Path.Combine(LogDir, "mount-owner.json"); } }
         public Engine(string root)
         {
+            LastBackupElapsedSeconds = -1;
             Root = root; LogDir = Path.Combine(root, "logs"); Directory.CreateDirectory(LogDir);
             string result = Path.Combine(LogDir, "backup-result.txt");
             if (File.Exists(result)) LastBackup = File.ReadAllText(result);
@@ -353,6 +355,18 @@ namespace MagicTray
             foreach (string d in Environment.GetLogicalDrives()) if (d.StartsWith(drive, StringComparison.OrdinalIgnoreCase)) return true;
             return false;
         }
+        public static bool WinFspInstalled
+        {
+            get { return File.Exists(@"C:\Program Files (x86)\WinFsp\bin\winfsp-x64.dll") || File.Exists(@"C:\Program Files\WinFsp\bin\winfsp-x64.dll"); }
+        }
+        public static string FormatDuration(double seconds)
+        {
+            seconds = Math.Max(0, seconds);
+            if (seconds < 60) return seconds.ToString("0.0", CultureInfo.InvariantCulture) + " 秒";
+            TimeSpan elapsed = TimeSpan.FromSeconds(seconds);
+            if (seconds < 3600) return (int)elapsed.TotalMinutes + " 分 " + elapsed.Seconds + " 秒";
+            return (int)elapsed.TotalHours + " 小时 " + elapsed.Minutes + " 分 " + elapsed.Seconds + " 秒";
+        }
         [DllImport("advapi32.dll", SetLastError = true)]
         private static extern bool GetTokenInformation(IntPtr token, int kind, IntPtr buffer, int length, out int needed);
         public static bool IsLowIntegrity()
@@ -411,7 +425,7 @@ namespace MagicTray
                 Test(c); return;
             }
             if (DriveOccupied(c.Drive)) throw new Exception(c.Drive + " 已被占用（可能是旧版挂载），请选择其他盘符或先卸载旧盘。");
-            if (!File.Exists(@"C:\Program Files (x86)\WinFsp\bin\winfsp-x64.dll") && !File.Exists(@"C:\Program Files\WinFsp\bin\winfsp-x64.dll"))
+            if (!WinFspInstalled)
                 throw new Exception("尚未安装 WinFsp。请在“详细信息”页打开 WinFsp 官方下载链接，安装后再挂载。");
             Test(c);
             string cache = Path.Combine(LogDir, "cache"); Directory.CreateDirectory(cache);
@@ -708,6 +722,7 @@ namespace MagicTray
             try
             {
                 LastUploaded = 0; LastPending = 0; LastProvisional = 0;
+                LastBackupElapsedSeconds = -1;
                 c.Validate(true);
                 string source = c.Source;
                 string app = Path.GetFullPath(Root).TrimEnd('\\') + "\\";
@@ -870,6 +885,8 @@ namespace MagicTray
                         (SkippedCount == 0 ? "备份成功" : (snapshot.Count == 0 ? "未备份任何文件，" + SkippedCount + " 项跳过（未备份）" : reportState)) +
                         "：检查 " + snapshot.Count + "，上传 " + uploadedCount + " / " + expectedTotal + " 个文件。";
                 }
+                LastBackupElapsedSeconds = totalClock.Elapsed.TotalSeconds;
+                LastBackup += " 总耗时 " + FormatDuration(LastBackupElapsedSeconds) + "。";
                 try { SaveResult(); } catch (Exception ex) { Say("备份已完成，但本地结果写入失败：" + Safe(FirstLine(ex.Message), c)); }
                 Say(LastBackup);
             }
@@ -880,6 +897,8 @@ namespace MagicTray
                 LastBackup = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + (ex is OperationCanceledException ? "  已停止" : (partial ? "  部分完成" : "  备份失败")) +
                     (LastPending > 0 ? "：已上传 " + LastUploaded + " / " + (LastUploaded + LastPending) + "，剩余 " + LastPending + " 个；" : "：") + Safe(FirstLine(ex.Message), c);
                 if (reportStarted && SkippedCount > 0) LastBackup += "（另有 " + SkippedCount + " 项跳过，详见跳过项目）";
+                LastBackupElapsedSeconds = totalClock.Elapsed.TotalSeconds;
+                LastBackup += " 总耗时 " + FormatDuration(LastBackupElapsedSeconds) + "。";
                 try { SaveResult(); } catch (Exception save) { Say("备份结果已生成，但本地结果写入失败：" + Safe(FirstLine(save.Message), c)); }
                 throw;
             }

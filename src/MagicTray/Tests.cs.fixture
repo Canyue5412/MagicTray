@@ -45,6 +45,7 @@ namespace MagicTray
                     File.WriteAllText(Path.Combine(source, "中文 空格.txt"), "测试", new UTF8Encoding(false));
                     File.WriteAllText(Path.Combine(source, "#literal.txt"), "literal");
                     engine.Backup(c);
+                    Assert(engine.LastBackupElapsedSeconds >= 0 && engine.LastBackup.Contains("总耗时") && File.ReadAllText(Path.Combine(engine.LogDir, "backup-result.txt")) == engine.LastBackup, "successful backup persists its elapsed duration");
                     Assert(File.ReadAllText(Path.Combine(ftp, "a.txt")) == "AAAA", "initial upload");
                     Assert(File.ReadAllText(Path.Combine(ftp, "中文 空格.txt")) == "测试", "Unicode file names and spaces");
                     Assert(File.Exists(Path.Combine(ftp, "#literal.txt")), "files-from-raw treats hash-prefixed name literally");
@@ -64,6 +65,7 @@ namespace MagicTray
                     engine.Stats += cancel;
                     bool stopped = false; try { engine.Backup(c); } catch (OperationCanceledException) { stopped = true; }
                     engine.Stats -= cancel; Assert(stopped && engine.LastBackup.Contains("已停止"), "cancellation never reports success");
+                    Assert(engine.LastBackupElapsedSeconds >= 0 && engine.LastBackup.Contains("总耗时"), "stopped backup retains its elapsed duration");
                     engine.ResetCancellation(); engine.Backup(c);
                     Assert(new FileInfo(Path.Combine(ftp, "cancel.bin")).Length == 3 * 1024 * 1024, "cancelled transfer retried successfully");
                     Config wrong = c.Snapshot(); wrong.Password = "wrong-password";

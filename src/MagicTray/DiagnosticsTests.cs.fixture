@@ -1,0 +1,39 @@
+// Allowlist/privacy checks use only generated configuration and no clipboard writes.
+using System;
+using System.IO;
+using MagicTray;
+
+internal static class DiagnosticsTests
+{
+    static int passed;
+    static void Check(bool value, string name) { if (!value) throw new Exception("FAIL: " + name); passed++; Console.WriteLine("PASS: " + name); }
+    static int Main(string[] args)
+    {
+        try
+        {
+            string run = Path.GetFullPath(args[0]); Directory.CreateDirectory(run);
+            Config cfg = new Config { Host = "private-host.example.invalid", User = "private-test-user", Password = "private-test-password", Source = @"D:\private-source-marker", Destination = "private-destination-marker", RclonePath = args[1], AutoBackup = true, AutoConnect = false, BackupTransfers = 3 };
+            using (Engine engine = new Engine(run))
+            {
+                engine.LastBackup = @"private-result-marker D:\private-error-path";
+                string summary = AppDiagnostics.Create(engine, cfg, false, false);
+                Check(summary.StartsWith("MagicTray 2.2.2") && summary.Contains(".NET 运行时"), "diagnostic includes the built version and runtime");
+                Check(summary.Contains("rclone：已找到") && summary.Contains("WinFsp：") && summary.Contains("完整性："), "diagnostic reports local dependencies and integrity");
+                foreach (string secret in new string[] { cfg.Host, cfg.User, cfg.Password, cfg.Source, cfg.Destination, cfg.RclonePath, engine.LastBackup, "private-error-path", run })
+                    Check(!summary.Contains(secret), "diagnostic excludes supplied private value " + (passed - 1));
+                Check(summary.Contains("操作状态：空闲") && summary.Contains("上传并发：3") && summary.Contains("自动备份：启用"), "idle diagnostic reports only safe state values");
+                Check(!summary.Contains("最近结束的备份"), "diagnostic does not invent counters for restored textual results");
+                Check(AppDiagnostics.Create(engine, cfg, true, true).Contains("操作状态：备份进行中"), "backup state is explicit");
+                Check(AppDiagnostics.Create(engine, cfg, true, false).Contains("操作状态：连接操作进行中"), "connection operation is distinguished from backup");
+                cfg.RclonePath = Path.Combine(run, "private-missing-rclone-marker.exe");
+                string missing = AppDiagnostics.Create(engine, cfg, false, false);
+                Check(missing.Contains("rclone：未找到") && !missing.Contains("private-missing-rclone-marker"), "missing dependency never exposes its configured path or exception");
+                Check(Directory.GetFiles(run, "*.ini").Length == 0 && Directory.GetFiles(engine.LogDir).Length == 0, "creating diagnostics does not save configuration, run FTP or write logs");
+            }
+            Check(Engine.FormatDuration(0) == "0.0 秒" && Engine.FormatDuration(1.25) == "1.3 秒", "short elapsed durations remain readable");
+            Check(Engine.FormatDuration(125) == "2 分 5 秒" && Engine.FormatDuration(3725) == "1 小时 2 分 5 秒", "long elapsed durations show minutes and hours");
+            Console.WriteLine("ALL PASSED: " + passed); return 0;
+        }
+        catch (Exception ex) { Console.WriteLine(ex); return 1; }
+    }
+}

@@ -26,6 +26,7 @@ namespace MagicTray
         private Button connect, disconnect, test, save, backup, stop, open, viewSkipped;
         private readonly System.Windows.Forms.Timer timer = new System.Windows.Forms.Timer();
         private bool busy, backingUp, checking, paused, exiting;
+        private readonly Stopwatch backupClock = new Stopwatch();
         private DateTime nextBackup = DateTime.MaxValue, nextCheck = DateTime.MinValue;
         private readonly List<Control> ftpInputs = new List<Control>();
 
@@ -177,6 +178,11 @@ namespace MagicTray
         }
         private void BuildDetailsPage(TableLayoutPanel page)
         {
+            TableLayoutPanel diagnostics = Card("诊断与日志", "摘要只包含版本、依赖和状态。原始日志可能包含连接信息与文件路径。"); page.Controls.Add(diagnostics);
+            FlowLayoutPanel diagnosticActions = Flow();
+            diagnosticActions.Controls.Add(Button("打开日志文件夹", delegate { OpenPath(engine.LogDir); }));
+            diagnosticActions.Controls.Add(Button("复制脱敏诊断摘要", CopyDiagnostics));
+            diagnostics.Controls.Add(diagnosticActions);
             TableLayoutPanel help = Card("使用与备份规则", null); page.Controls.Add(help);
             help.Controls.Add(Note("连接：开启手机 FTP 服务后填写地址和账号，挂载盘符可选。"));
             help.Controls.Add(Note("备份：只上传新增与修改文件，电脑删除不会删除手机副本。首次扫描会计算内容摘要，可能需要一些时间。"));
@@ -192,7 +198,7 @@ namespace MagicTray
             dependencies.Controls.Add(links);
             dependencies.Controls.Add(Note("rclone 负责传输，WinFsp 用于挂载磁盘。依赖需自行安装；rclone 可放在工具目录、tools 子目录或 PATH 中。"));
             dependencies.Controls.Add(Note("密码通过 Windows DPAPI 保存，仅当前 Windows 用户可解密。FTP 使用明文连接，请在可信局域网内使用。"));
-            TableLayoutPanel about = Card("MagicTray 2.2.1 · AI 制作", null); page.Controls.Add(about);
+            TableLayoutPanel about = Card("MagicTray 2.2.2 · AI 制作", null); page.Controls.Add(about);
             about.Controls.Add(Note("最初版本由 DeepSeek 制作；后续由 OpenAI Codex（GPT-6.1 Sol）辅助迭代。用户主导需求、测试与验收。程序本地运行，无需 AI API。"));
             TableLayoutPanel logArea = Stack(); logArea.Visible = false;
             log.Multiline = true; log.ReadOnly = true; log.ScrollBars = ScrollBars.Both; log.WordWrap = false;
@@ -279,6 +285,15 @@ namespace MagicTray
         }
         private void OpenPath(string path) { try { Process.Start("explorer.exe", Engine.Quote(path)); } catch (Exception ex) { ShowError(ex.Message); } }
         private void ShowError(string message) { MessageBox.Show(this, message, "MagicTray", MessageBoxButtons.OK, MessageBoxIcon.Warning); }
+        private void CopyDiagnostics()
+        {
+            try
+            {
+                Clipboard.SetText(AppDiagnostics.Create(engine, cfg.Snapshot(), busy, backingUp));
+                AddLog("已复制脱敏诊断摘要，未包含连接资料、文件路径或原始日志。");
+            }
+            catch { ShowError("暂时无法写入剪贴板，请稍后重试。"); }
+        }
         internal Form CreateSkippedWindow() { return new SkippedItemsForm(engine.ReadSkippedReport(), engine.SkippedCount); }
         private bool ReadSettings(bool forBackup)
         {
@@ -297,7 +312,7 @@ namespace MagicTray
         {
             if (busy) return;
             busy = true; backingUp = isBackup; engine.ResetCancellation(); UpdateControls();
-            if (isBackup) { summary.Text = title; summary.ForeColor = Color.DarkSlateGray; progress.Value = 0; progress.Style = ProgressBarStyle.Marquee; current.Text = "正在准备…"; }
+            if (isBackup) { backupClock.Restart(); summary.Text = title; summary.ForeColor = Color.DarkSlateGray; progress.Value = 0; progress.Style = ProgressBarStyle.Marquee; current.Text = "正在准备…"; }
             else connection.Text = title;
             Config snapshot = cfg.Snapshot();
             ThreadPool.QueueUserWorkItem(delegate
@@ -309,11 +324,12 @@ namespace MagicTray
                     busy = false; backingUp = false;
                     if (isBackup)
                     {
+                        backupClock.Stop();
                         progress.Style = ProgressBarStyle.Blocks; progress.Value = error == null ? 100 : 0;
                         summary.Text = error == null ? (engine.LastProvisional > 0 ? "本轮部分完成：" + engine.LastProvisional + " 个文件仅核对大小，下一轮重试" : (engine.SkippedCount == 0 ? "本轮备份完成" : "备份完成，" + engine.SkippedCount + " 项跳过（未备份）")) : (error is OperationCanceledException ? "备份已停止" : (engine.LastPending > 0 ? "备份未完成：已上传 " + engine.LastUploaded + " 个，剩余 " + engine.LastPending + " 个" + (engine.SkippedCount > 0 ? "，跳过 " + engine.SkippedCount + " 个" : "") : "备份失败，请查看“详细信息”页日志"));
                         if (error == null && engine.LastBackup.Contains("未备份任何文件")) summary.Text = "未备份任何文件，" + engine.SkippedCount + " 项跳过（未备份）";
                         summary.ForeColor = error != null ? Color.Firebrick : (engine.SkippedCount > 0 || engine.LastProvisional > 0 ? Color.DarkOrange : Color.DarkSlateGray);
-                        current.Text = "当前无文件传输"; last.Text = engine.LastBackup;
+                        current.Text = "本轮耗时 " + Engine.FormatDuration(backupClock.Elapsed.TotalSeconds) + " · 当前无文件传输"; last.Text = engine.LastBackup;
                         nextBackup = cfg.AutoBackup ? DateTime.Now.AddMinutes(cfg.BackupMinutes) : DateTime.MaxValue;
                     }
                     if (error != null)
@@ -360,7 +376,8 @@ namespace MagicTray
         }
         private void Tick()
         {
-            next.Text = cfg.AutoBackup ? (backingUp ? "本轮结束后安排下一次扫描" : "下次自动扫描：" + (nextBackup == DateTime.MaxValue ? "等待保存设置" : nextBackup.ToString("HH:mm:ss"))) : "自动备份未启用 · 修改后点击“保存设置”生效";
+            next.Text = backingUp ? "本轮已耗时 " + Engine.FormatDuration(backupClock.Elapsed.TotalSeconds) + (cfg.AutoBackup ? " · 结束后安排下一次扫描" : "") :
+                (cfg.AutoBackup ? "下次自动扫描：" + (nextBackup == DateTime.MaxValue ? "等待保存设置" : nextBackup.ToString("HH:mm:ss")) : "自动备份未启用 · 修改后点击“保存设置”生效");
             if (busy) return;
             if (cfg.AutoBackup && DateTime.Now >= nextBackup) { StartBackup(false); return; }
             if (checking || DateTime.Now < nextCheck || cfg.Password.Length == 0) return;

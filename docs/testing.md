@@ -33,8 +33,11 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\tests\run-local.ps1 -Rclon
 | rename-compatibility / remote-denied | 临时改名拒绝兼容、普通写入拒绝与旧版本保护 |
 | local / remote / mixed permissions | 本地权限恢复、上传时拒绝及 FTP 权限错误分类 |
 | audit-2.2.1 | 精确改名拒绝分类、临时文件清理范围、状态写入失败保留旧记录、部分成功及下一轮补传 |
+| diagnostics | 2.2.2 摘要的敏感信息排除、依赖缺失、忙碌状态与耗时格式；不改剪贴板 |
 
 每组打印退出码与最终断言摘要，汇总写入测试目录的 `summary.json`。任何组失败时脚本返回 1；编译失败、服务无法启动或超时会直接报错。默认单组超时为 240 秒，可通过 `-TimeoutSeconds` 调整。
+
+2.2.2 完整入口共 165 项断言通过，包含 UI 37 项、备份集成 19 项、审查 25 项、诊断 19 项及原有配置/权限/兼容回归。复制按钮的剪贴板写入未自动操作用户剪贴板；自动验证的是该按钮所调用的摘要生成方法。真实手机和已有挂载未参与测试。
 
 `local-permissions` 仅对测试生成的文件暂时设置 ACL 拒绝，夹具在 `finally` 中恢复。不要强制结束测试，等待它完成或抛出结果。
 

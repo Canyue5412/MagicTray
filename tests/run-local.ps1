@@ -3,8 +3,8 @@
 param(
     [Parameter(Mandatory = $true)][string]$RclonePath,
     [string]$Python = 'python',
-    [ValidateSet('configuration', 'remote-name', 'ui', 'backup-integration', 'rename-compatibility', 'remote-denied', 'local-permissions', 'remote-permissions', 'mixed-permissions', 'audit-2.2.1')]
-    [string[]]$Cases = @('configuration', 'remote-name', 'ui', 'backup-integration', 'rename-compatibility', 'remote-denied', 'local-permissions', 'remote-permissions', 'mixed-permissions', 'audit-2.2.1'),
+    [ValidateSet('configuration', 'remote-name', 'ui', 'backup-integration', 'rename-compatibility', 'remote-denied', 'local-permissions', 'remote-permissions', 'mixed-permissions', 'audit-2.2.1', 'diagnostics')]
+    [string[]]$Cases = @('configuration', 'remote-name', 'ui', 'backup-integration', 'rename-compatibility', 'remote-denied', 'local-permissions', 'remote-permissions', 'mixed-permissions', 'audit-2.2.1', 'diagnostics'),
     [ValidateRange(30, 1800)][int]$TimeoutSeconds = 240
 )
 $ErrorActionPreference = 'Stop'
@@ -99,6 +99,7 @@ $integration = Compile-Fixture 'Tests' 'MagicTray.IntegrationTests'
 $compatibility = Compile-Fixture 'BackupCompatibilityTests' 'BackupCompatibilityTests'
 $skip = Compile-Fixture 'SkipTests' 'SkipTests'
 $audit = Compile-Fixture 'AuditTests' 'AuditTests'
+$diagnostics = Compile-Fixture 'DiagnosticsTests' 'DiagnosticsTests'
 
 Run-Case 'configuration' $config '' @() -NoServer
 Run-Case 'remote-name' $rename '' @($rcloneExe) -NoServer
@@ -110,6 +111,7 @@ Run-Case 'local-permissions' $skip '' @('normal')
 Run-Case 'remote-permissions' $skip 'reject-store' @('remote')
 Run-Case 'mixed-permissions' $skip 'reject-selected-store' @('mixed')
 Run-Case 'audit-2.2.1' $audit 'reject-selected-store' @($rcloneExe)
+Run-Case 'diagnostics' $diagnostics '' @($rcloneExe) -NoServer
 
 Write-Host ('Results: ' + $testRoot)
 $results | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $testRoot 'summary.json') -Encoding UTF8
