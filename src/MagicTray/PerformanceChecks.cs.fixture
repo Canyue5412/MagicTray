@@ -1,0 +1,22 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Text;
+using System.Web.Script.Serialization;
+using MagicTray;
+internal static class PerformanceChecks {
+static int Main(string[] args) { try {
+string run=Path.GetFullPath(args[0]),ftp=Path.GetFullPath(args[2]);Directory.CreateDirectory(run);
+int count=600,parallel=int.Parse(args[3]);
+string source=Path.Combine(run,"source");Directory.CreateDirectory(source);
+byte[] content=new byte[8192];for(int i=0;i<content.Length;i++)content[i]=(byte)(i*31+7);
+for(int i=0;i<count;i++){string folder=Path.Combine(source,"folder-"+(i%12));Directory.CreateDirectory(folder);File.WriteAllBytes(Path.Combine(folder,"item-"+i.ToString("D4")+".bin"),content);}
+Config c=new Config();c.Host="127.0.0.1";c.Port=int.Parse(args[1]);c.User="tester";c.Password="空 格 & $ \" \\ end";c.Source=source;c.Destination="benchmark";c.RemotePath="";c.BackupTransfers=parallel;c.RclonePath=(Environment.GetEnvironmentVariable("MAGICTRAY_TEST_RCLONE") ?? "rclone.exe");
+List<string> phases=new List<string>();long elapsed;
+using(Engine engine=new Engine(Path.Combine(run,"app"))){engine.Message+=delegate(string line){if(line.Contains("阶段耗时")||line.Contains("本轮总耗时"))phases.Add(line.Substring(10));};Stopwatch clock=Stopwatch.StartNew();engine.Backup(c);elapsed=clock.ElapsedMilliseconds;if(engine.SkippedCount!=0||!engine.LastBackup.Contains("上传 "+count+" "))throw new Exception("Unexpected incomplete benchmark backup");}
+string target=Path.Combine(ftp,"benchmark");if(Directory.GetFiles(target,"*",SearchOption.AllDirectories).Length!=count)throw new Exception("Wrong remote file count");
+foreach(string file in Directory.GetFiles(target,"*",SearchOption.AllDirectories)){byte[] actual=File.ReadAllBytes(file);if(actual.Length!=content.Length)throw new Exception("Wrong length");for(int i=0;i<actual.Length;i++)if(actual[i]!=content[i])throw new Exception("Wrong content");}
+string output=new JavaScriptSerializer().Serialize(new Dictionary<string,object>{{"concurrency",parallel},{"files",count},{"bytes",count*content.Length},{"elapsed_seconds",elapsed/1000.0},{"content_verified",true},{"phases",phases}});File.WriteAllText(Path.Combine(run,"benchmark-result.json"),output,new UTF8Encoding(false));Console.WriteLine(output);return 0;
+}catch(Exception ex){Console.WriteLine(ex);return 1;}}
+}

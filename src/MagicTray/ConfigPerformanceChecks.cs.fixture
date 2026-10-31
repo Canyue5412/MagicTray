@@ -1,0 +1,15 @@
+using System;
+using System.IO;
+using MagicTray;
+internal static class ConfigPerformanceChecks {
+static int passed;
+static void Check(bool valid,string message){if(!valid)throw new Exception(message);passed++;Console.WriteLine("PASS: "+message);}
+static int Main(string[] args){try{
+string root=Path.GetFullPath(args[0]);Directory.CreateDirectory(root);
+string path=Path.Combine(root,"synthetic.ini"),text="Host=192.0.2.10\r\nUser=example\r\nAutoConnect=false\r\n";File.WriteAllText(path,text);
+Config c=Config.Load(path);Check(c.BackupTransfers==2&&File.ReadAllText(path)==text,"configuration without performance field uses 2 without rewriting existing data");c.Password="synthetic password";
+c.BackupTransfers=1;c.Save();Check(Config.Load(path).BackupTransfers==1,"single-transfer fallback persists and reloads");c.BackupTransfers=4;c.Validate(false);c.Save();Check(Config.Load(path).BackupTransfers==4,"upper limit 4 validates and persists");
+foreach(int invalid in new int[]{0,5}){c.BackupTransfers=invalid;bool rejected=false;try{c.Validate(false);}catch(Exception ex){rejected=ex.Message.Contains("上传并发");}Check(rejected,"out-of-range concurrency "+invalid+" is rejected");}
+File.WriteAllText(path,"BackupTransfers=invalid\r\n");Check(Config.Load(path).BackupTransfers==2,"malformed performance setting falls back to safe default 2");Console.WriteLine("ALL PASSED: "+passed);return 0;
+}catch(Exception ex){Console.WriteLine(ex);return 1;}}
+}

@@ -1,0 +1,68 @@
+﻿using System;
+using System.Collections.Generic;
+using System.Drawing;
+using System.IO;
+using System.Reflection;
+using System.Runtime.InteropServices;
+using System.Windows.Forms;
+namespace MagicTray {
+internal static class UiCheck {
+[DllImport("user32.dll")] static extern int GetWindowLong(IntPtr window,int index);
+[DllImport("user32.dll")] static extern int SetWindowLong(IntPtr window,int index,int value);
+static int passed;
+static void Assert(bool valid,string message) { if(!valid) throw new Exception(message); passed++; Console.WriteLine("PASS: "+message); }
+static T Field<T>(MainForm form,string name) {return (T)typeof(MainForm).GetField(name,BindingFlags.NonPublic|BindingFlags.Instance).GetValue(form);}
+static void Set(MainForm form,string name,object value) {typeof(MainForm).GetField(name,BindingFlags.NonPublic|BindingFlags.Instance).SetValue(form,value);}
+static object Invoke(MainForm form,string name,params object[] args){return typeof(MainForm).GetMethod(name,BindingFlags.NonPublic|BindingFlags.Instance).Invoke(form,args);}
+static Control Find(Control parent,string text) {foreach(Control child in parent.Controls){if(child.Text==text)return child;Control found=Find(child,text);if(found!=null)return found;}return null;}
+static void CheckControls(Control parent) {
+foreach(Control child in parent.Controls) {
+if(!child.Visible)continue;
+if((child is Button || child is TextBox || child is NumericUpDown || child is ComboBox || child is CheckBox) && !parent.ClientRectangle.Contains(child.Bounds)) throw new Exception("Clipped control: "+child.Text+" "+child.Bounds+" in "+parent.ClientRectangle);
+CheckControls(child);
+}}
+static void ClearSelection(Control parent){TextBox t=parent as TextBox;if(t!=null){t.SelectionStart=0;t.SelectionLength=0;}foreach(Control c in parent.Controls)ClearSelection(c);}
+static void Render(Form form,string path) {
+form.StartPosition=FormStartPosition.Manual;form.Location=new Point(-30000,-30000);form.ShowInTaskbar=false;form.CreateControl();
+SetWindowLong(form.Handle,-20,GetWindowLong(form.Handle,-20)|0x08000000|0x00000080);
+form.Show();Application.DoEvents();form.PerformLayout();Application.DoEvents();
+foreach(Control c in form.Controls)ClearSelection(c);
+CheckControls(form);
+using(Bitmap bmp=new Bitmap(form.Width,form.Height)){form.DrawToBitmap(bmp,new Rectangle(0,0,bmp.Width,bmp.Height));bmp.Save(path);}
+Assert(true,"rendered "+Path.GetFileName(path)+" without clipped controls");
+}
+static Panel Scroll(TabControl tabs){return (Panel)tabs.SelectedTab.Controls[0];}
+[STAThread] static int Main(string[] args) {
+try {
+Application.EnableVisualStyles();Application.SetCompatibleTextRenderingDefault(false);
+string root=Path.GetFullPath(args[0]),logs=Path.Combine(root,"logs");Directory.CreateDirectory(logs);
+File.WriteAllText(Path.Combine(logs,"backup-skipped.txt"),"跳过项目：3\r\n开始时间：2026-10-30 12:00:00\r\n电脑源文件夹：D:\\示例资料\\\r\n本轮状态：备份完成，3 项跳过（未备份）\r\n不可访问的目录每个计 1 项，内部未扫描、未计数。权限恢复后下轮重新尝试。\r\n\r\nD:\\示例资料\\本学期课程与研究资料\\需要保留的中文长文件夹名称\\项目附件与实验记录\\受限资料\\中文长路径示例文件.pdf\r\n  原因：本地访问被拒绝\r\n\r\nD:\\示例资料\\受限目录\\\r\n  原因：目录访问被拒绝，其内部未扫描\r\n\r\nD:\\示例资料\\链接目录\r\n  原因：目录链接：避免重复或循环，其内部未扫描\r\n");
+File.WriteAllText(Path.Combine(logs,"backup-result.txt"),"最近备份：检查 12，上传 8 个文件，3 项跳过（未备份）。");
+Config defaults=Config.Load(Path.Combine(root,"fresh-settings.ini"));Assert(defaults.Host==""&&defaults.User==""&&!defaults.AutoConnect,"fresh installation has no personal connection defaults");
+Config c=Config.Load(Path.Combine(root,"ui-settings.ini"));c.AutoConnect=false;c.AutoBackup=false;c.Host="192.0.2.10";c.User="示例账户";c.Password="";c.Source=@"D:\示例资料";c.Destination="Backup/Example";
+Assert(c.Target=="magictray:"&&c.BackupTarget=="magictray:Backup/Example","renamed FTP target uses the shared MagicTray remote");
+using(Engine e=new Engine(root)) using(MainForm main=new MainForm(c,e)) {
+TabControl tabs=Field<TabControl>(main,"tabs");Assert(tabs.TabCount==3&&tabs.TabPages[0].Text=="FTP 连接"&&tabs.TabPages[1].Text=="传输文件"&&tabs.TabPages[2].Text=="详细信息","three ordered pages cover connection, transfer and details");
+Render(main,Path.Combine(root,"ui-connection.png"));Assert(main.ClientSize==new Size(720,560),"default client size is 720 by 560");Assert(!Scroll(tabs).HorizontalScroll.Visible&&!Scroll(tabs).VerticalScroll.Visible,"connection page fits default window");
+Label connection=Field<Label>(main,"connection");Assert(connection.Visible&&connection.Parent.Parent==main.Controls[0],"connection state is shared outside all tab pages");
+Button advanced=(Button)Find(main,"+  高级连接设置"),log=(Button)Find(main,"+  运行日志");Assert(advanced!=null&&log!=null,"advanced connection settings and log start collapsed");
+advanced.PerformClick();Render(main,Path.Combine(root,"ui-connection-expanded.png"));Assert(!Scroll(tabs).HorizontalScroll.Visible,"advanced connection fields do not overflow horizontally");advanced.PerformClick();
+Set(main,"busy",true);Set(main,"backingUp",true);Invoke(main,"UpdateControls");
+Assert(Field<Button>(main,"stop").Enabled&&!Field<Button>(main,"backup").Enabled&&!Field<Button>(main,"browse").Enabled&&!Field<TextBox>(main,"source").Enabled&&!Field<Button>(main,"saveConnection").Enabled&&!Field<NumericUpDown>(main,"backupTransfers").Enabled,"backup keeps stop available and disables edits across pages");
+Invoke(main,"RenderStats",new Dictionary<string,object>{{"bytes",50331648D},{"totalBytes",104857600D},{"speed",2621440D},{"transfers",4D},{"totalTransfers",10D},{"errors",0D},{"transferring",new object[]{new Dictionary<string,object>{{"name","示例资料/课程笔记.pdf"}}}}});
+tabs.SelectedIndex=1;Render(main,Path.Combine(root,"ui-transfer.png"));Assert(connection.Visible,"shared connection status stays visible on transfer page");Assert(Field<ProgressBar>(main,"progress").Value==48&&Field<Label>(main,"current").Text.Contains("课程笔记"),"transfer progress and current file still render");Assert(!Scroll(tabs).HorizontalScroll.Visible&&!Scroll(tabs).VerticalScroll.Visible,"transfer actions and status fit default window");
+Set(main,"busy",false);Set(main,"backingUp",false);Invoke(main,"UpdateControls");
+Field<Label>(main,"summary").Text="最近备份有 3 项跳过（未备份）";Field<Label>(main,"current").Text="无需挂载，开始备份时自动保存设置。";Field<ProgressBar>(main,"progress").Value=0;Render(main,Path.Combine(root,"ui-transfer-ready.png"));
+tabs.SelectedIndex=2;Render(main,Path.Combine(root,"ui-details.png"));Assert(connection.Visible&&!Scroll(tabs).HorizontalScroll.Visible&&Scroll(tabs).VerticalScroll.Visible,"details page scrolls vertically with shared status");
+log.PerformClick();Field<TextBox>(main,"log").Text="12:00:00  示例：正在扫描电脑文件夹。\r\n12:00:02  示例：备份完成，3 项跳过（未备份）。";Scroll(tabs).ScrollControlIntoView(Field<TextBox>(main,"log"));Render(main,Path.Combine(root,"ui-log.png"));Assert(Field<TextBox>(main,"log").Visible,"optional runtime log opens on details page");log.PerformClick();
+main.Size=main.MinimumSize;
+for(int i=0;i<3;i++){tabs.SelectedIndex=i;Render(main,Path.Combine(root,"ui-minimum-"+(i+1)+".png"));Assert(!Scroll(tabs).HorizontalScroll.Visible&&connection.Visible,"minimum window page "+(i+1)+" retains shared state without horizontal overflow");}
+Message message=new Message();object[] keyArgs={message,Keys.Control|Keys.D1};Assert((bool)Invoke(main,"ProcessCmdKey",keyArgs)&&tabs.SelectedIndex==0,"Ctrl+1 switches to FTP connection");keyArgs=new object[]{message,Keys.Control|Keys.D2};Assert((bool)Invoke(main,"ProcessCmdKey",keyArgs)&&tabs.SelectedIndex==1,"Ctrl+2 switches to file transfer");keyArgs=new object[]{message,Keys.Control|Keys.D3};Assert((bool)Invoke(main,"ProcessCmdKey",keyArgs)&&tabs.SelectedIndex==2,"Ctrl+3 switches to details");
+using(Form skipped=main.CreateSkippedWindow()){Render(skipped,Path.Combine(root,"ui-skipped.png"));Assert(skipped.CancelButton!=null&&skipped.AcceptButton!=null,"skip report closes with Escape or Enter");}
+main.ClientSize=new Size(720,560);tabs.SelectedIndex=1;main.Scale(new SizeF(1.5F,1.5F));Render(main,Path.Combine(root,"ui-scale150.png"));Assert(!Scroll(tabs).HorizontalScroll.Visible,"simulated 150 percent transfer layout has no horizontal overflow");main.Scale(new SizeF(4F/3F,4F/3F));Render(main,Path.Combine(root,"ui-scale200.png"));Assert(!Scroll(tabs).HorizontalScroll.Visible,"simulated 200 percent transfer layout has no horizontal overflow");
+main.Hide();
+}
+Console.WriteLine("TOTAL: "+passed+" checks passed");return 0;
+}catch(Exception ex){Console.WriteLine(ex);return 1;}
+}
+}}

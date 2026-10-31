@@ -1,9 +1,9 @@
-using System;
+﻿using System;
 using System.IO;
 using System.Threading;
 using System.Windows.Forms;
 
-namespace Magic5Tray
+namespace MagicTray
 {
     internal static class Program
     {
@@ -14,14 +14,16 @@ namespace Magic5Tray
             Application.SetCompatibleTextRenderingDefault(false);
             try
             {
+                if (args.Length > 1 || (args.Length == 1 && args[0] != "--check" && args[0] != "--mount" && args[0] != "--unmount"))
+                    throw new ArgumentException("支持的参数：--check、--mount、--unmount；直接打开程序可使用完整界面。");
                 string root = AppDomain.CurrentDomain.BaseDirectory;
-                Config cfg = Config.Load(Path.Combine(root, "Magic5Tray.ini"));
+                Config cfg = Config.Load(Path.Combine(root, "MagicTray.ini"));
                 using (Engine engine = new Engine(root))
                 {
                     bool created;
-                    using (Mutex mutex = new Mutex(true, "Magic5Tray_SingleInstance", out created))
+                    using (Mutex mutex = new Mutex(true, "MagicTray_SingleInstance", out created))
                     {
-                        if (!created) { MessageBox.Show("网盘工具已经在运行，请使用已打开的窗口。", "Magic5 网盘"); return; }
+                        if (!created) { MessageBox.Show("网盘工具已经在运行，请使用已打开的窗口。", "MagicTray"); return; }
                         if (args.Length > 0 && args[0] == "--check")
                         {
                             try { engine.Test(cfg); File.WriteAllText(Path.Combine(engine.LogDir, "check.log"), "FTP 登录及目录读取成功\r\n" + DateTime.Now); }
@@ -36,7 +38,7 @@ namespace Magic5Tray
             }
             catch (Exception ex)
             {
-                MessageBox.Show(ex.Message, "Magic5 网盘 - 操作失败", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                MessageBox.Show(ex.Message, "MagicTray - 操作失败", MessageBoxButtons.OK, MessageBoxIcon.Error);
                 Environment.ExitCode = 1;
             }
         }

@@ -1,0 +1,51 @@
+using System;
+using System.IO;
+using System.Text;
+using System.Linq;
+using MagicTray;
+class BackupCompatibilityTests {
+static int passed;
+static void Assert(bool ok,string label) { if(!ok) throw new Exception("FAIL: "+label); Console.WriteLine("PASS: "+label); passed++; }
+static bool HasVersion(string folder,string name,string contents) { return Directory.GetFiles(folder,name,SearchOption.AllDirectories).Any(delegate(string f){return File.ReadAllText(f)==contents;}); }
+static int Main(string[] args) {
+string run=Path.GetFullPath(args[0]), ftpRoot=Path.GetFullPath(args[2]);
+Directory.CreateDirectory(run);
+Console.SetOut(new StreamWriter(Path.Combine(run,"test-results.log"),false,new UTF8Encoding(false)){AutoFlush=true});
+string app=Path.Combine(run,"app"), source=Path.Combine(run,"source");
+Directory.CreateDirectory(source);
+Config c=new Config();c.Host="127.0.0.1";c.Port=int.Parse(args[1]);c.User="tester";c.Password="空 格 & $ \" \\ end";
+c.Source=source;c.Destination="backup";c.RemotePath="";c.RclonePath=(Environment.GetEnvironmentVariable("MAGICTRAY_TEST_RCLONE") ?? "rclone.exe");
+string destination=Path.Combine(ftpRoot,"backup"),versions=Path.Combine(ftpRoot,"backup_versions");
+try {using(Engine e=new Engine(app)) {
+bool fallback=false;int fallbackCount=0;e.Message+=delegate(string s){Console.WriteLine(s);if(s.Contains("兼容模式重试")){fallback=true;fallbackCount++;}};
+if(args[3]=="denied") {
+File.WriteAllText(Path.Combine(source,"denied.txt"),"new");bool rejected=false;
+try{e.Backup(c);}catch(Exception ex){rejected=ex.Message.Contains("Synthetic upload permission denied")&&!ex.Message.Contains("\"stats\"")&&!ex.Message.Contains("\"time\"");}
+Assert(rejected,"JSON upload error reduced to readable message");
+Assert(!fallback,"ordinary FTP permission errors do not trigger rename compatibility");
+Assert(e.LastBackup.Contains("备份失败")&&!e.LastBackup.Contains("备份成功"),"upload error never reported as success");
+Assert(Directory.GetFiles(e.LogDir,"backup-manifest-*.json").Length==0,"failed upload does not write success manifest");
+} else {
+Directory.CreateDirectory(destination);
+File.WriteAllText(Path.Combine(destination,"allow.txt"),"original A");File.WriteAllText(Path.Combine(destination,"reject-rename.txt"),"original B");
+File.WriteAllText(Path.Combine(source,"allow.txt"),"updated A");File.WriteAllText(Path.Combine(source,"reject-rename.txt"),"updated B");
+e.Backup(c);
+Assert(fallback&&fallbackCount==1,"partial rename 553 triggers one compatible retry");
+Assert(File.ReadAllText(Path.Combine(destination,"allow.txt"))=="updated A"&&File.ReadAllText(Path.Combine(destination,"reject-rename.txt"))=="updated B","mixed first-attempt success and retry produce correct latest content");
+Assert(HasVersion(versions,"allow.txt","original A")&&HasVersion(versions,"reject-rename.txt","original B"),"retry preserves both original old versions");
+Assert(Directory.GetDirectories(versions).Length==1,"retry reuses the first-attempt version directory instead of duplicating uploaded files");
+Assert(Directory.GetFiles(destination,"*.partial",SearchOption.AllDirectories).Length==0,"rejected temporary uploads cleaned up");
+string manifest=Directory.GetFiles(e.LogDir,"backup-manifest-*.json")[0],before=File.ReadAllText(manifest);
+string cancelName="reject-rename-cancel.bin";File.WriteAllText(Path.Combine(destination,cancelName),"original cancellation version");File.WriteAllBytes(Path.Combine(source,cancelName),new byte[3*1024*1024]);
+fallback=false;Action<System.Collections.Generic.Dictionary<string,object>> cancel=delegate{if(fallback)e.Cancel();};e.Stats+=cancel;bool stopped=false;
+try{e.Backup(c);}catch(OperationCanceledException){stopped=true;}finally{e.Stats-=cancel;}
+Assert(stopped&&e.LastBackup.Contains("已停止"),"cancel during compatible direct upload reports stopped");
+Assert(File.ReadAllText(manifest)==before,"cancelled direct upload does not update successful manifest");
+Assert(HasVersion(versions,cancelName,"original cancellation version"),"cancelled direct upload retains previous complete version");
+e.ResetCancellation();e.Backup(c);
+Assert(new FileInfo(Path.Combine(destination,cancelName)).Length==3*1024*1024,"cancelled compatible transfer recovered next run");
+Assert(HasVersion(versions,cancelName,"original cancellation version"),"recovery still preserves original complete version");
+Assert(!e.LastBackup.Contains("\"stats\""),"backup result contains no JSON statistics");
+}
+}Console.WriteLine("ALL PASSED: "+passed);return 0;}catch(Exception ex){Console.WriteLine(ex);return 1;}
+}}

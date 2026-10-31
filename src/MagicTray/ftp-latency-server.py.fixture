@@ -1,0 +1,43 @@
+﻿"""Synthetic latency fixture; binds localhost only and serves generated data."""
+import json
+import pathlib
+import sys
+import threading
+import time
+sys.path.insert(0, sys.argv[4])
+from pyftpdlib.authorizers import DummyAuthorizer
+from pyftpdlib.handlers import FTPHandler
+from pyftpdlib.servers import ThreadedFTPServer
+root=pathlib.Path(sys.argv[1]).resolve()
+root.mkdir(parents=True,exist_ok=True)
+metrics_path=pathlib.Path(sys.argv[3])
+auth=DummyAuthorizer()
+auth.add_user('tester', '空 格 & $ " \\ end', str(root), perm='elradfmwMT')
+lock=threading.Lock()
+metrics={'store_commands':0,'rename_commands':0,'max_uploads_in_flight':0}
+active=set()
+class Handler(FTPHandler):
+    authorizer=auth
+    def ftp_STOR(self, file, mode='w'):
+        with lock:
+            metrics['store_commands']+=1
+            active.add(file)
+            metrics['max_uploads_in_flight']=max(metrics['max_uploads_in_flight'],len(active))
+        time.sleep(0.025)
+        return super().ftp_STOR(file,mode)
+    def ftp_RNTO(self, path):
+        with lock: metrics['rename_commands']+=1
+        time.sleep(0.025)
+        return super().ftp_RNTO(path)
+    def on_file_received(self,file):
+        with lock:active.discard(file)
+    def on_incomplete_file_received(self,file):
+        with lock:active.discard(file)
+    def on_disconnect(self):
+        with lock:
+            temporary=metrics_path.with_suffix('.tmp')
+            temporary.write_text(json.dumps(metrics))
+            temporary.replace(metrics_path)
+server=ThreadedFTPServer(('127.0.0.1',0),Handler)
+pathlib.Path(sys.argv[2]).write_text(str(server.socket.getsockname()[1]))
+server.serve_forever()

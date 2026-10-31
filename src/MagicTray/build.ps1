@@ -1,11 +1,11 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
-    Rebuild Magic5Tray.exe from Magic5Tray.cs using the .NET Framework compiler.
+    Rebuild MagicTray.exe from the C# source files using the .NET Framework compiler.
 
 .DESCRIPTION
-    Output goes to the repository root: ..\..\Magic5Tray.exe
-    The .ini file is not embedded; keep Magic5Tray.ini next to the exe.
+    Output goes to the repository root: ..\..\MagicTray.exe
+    The .ini file is not embedded; keep MagicTray.ini next to the exe.
     Restores only the generated executable's normal Medium integrity label.
     Run from a normal desktop PowerShell; administrator rights are not needed.
 #>
@@ -18,13 +18,13 @@ if (-not (Test-Path -LiteralPath $csc)) {
 
 $repoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 $source = @(Get-ChildItem -LiteralPath $PSScriptRoot -Filter '*.cs' | ForEach-Object { $_.FullName })
-$output = Join-Path $repoRoot 'Magic5Tray.exe'
-$staged = Join-Path $repoRoot 'Magic5Tray.build.exe'
+$output = Join-Path $repoRoot 'MagicTray.exe'
+$staged = Join-Path $repoRoot 'MagicTray.build.exe'
 $manifest = Join-Path $PSScriptRoot 'app.manifest'
 
-foreach ($process in @(Get-Process -Name 'Magic5Tray' -ErrorAction SilentlyContinue)) {
+foreach ($process in @(Get-Process -Name 'MagicTray' -ErrorAction SilentlyContinue)) {
     if ($process.Path -and [string]::Equals($process.Path, $output, [StringComparison]::OrdinalIgnoreCase)) {
-        throw 'Close Magic5Tray before rebuilding its executable.'
+        throw 'Close MagicTray before rebuilding its executable.'
     }
 }
 

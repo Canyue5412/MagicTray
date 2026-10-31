@@ -1,0 +1,114 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Text;
+using System.Threading;
+namespace MagicTray
+{
+    internal static class IntegrationTests
+    {
+        static int passed;
+        static void Assert(bool condition, string name) { if (!condition) throw new Exception("FAIL: " + name); Console.WriteLine("PASS: " + name); passed++; }
+        static bool WaitUntil(Func<bool> condition, int seconds)
+        {
+            DateTime until = DateTime.UtcNow.AddSeconds(seconds);
+            do { try { if (condition()) return true; } catch (IOException) { } Thread.Sleep(200); } while (DateTime.UtcNow < until);
+            return false;
+        }
+        [STAThread]
+        static int Main(string[] args)
+        {
+            string run = Path.GetFullPath(args[0]); Directory.CreateDirectory(run);
+            if (args.Length > 3) Console.SetOut(new StreamWriter(Path.Combine(run, "test-results.log"), false, new UTF8Encoding(false)) { AutoFlush = true });
+            string app = Path.Combine(run, "app"), source = Path.Combine(run, "source with spaces");
+            Directory.CreateDirectory(app); Directory.CreateDirectory(source);
+            Config c = Config.Load(Path.Combine(app, "MagicTray.ini"));
+            c.Host = "127.0.0.1"; c.Port = int.Parse(args[1]); c.User = "tester";
+            c.Password = "空 格 & $ \" \\ end"; c.AutoConnect = false;
+            c.Source = source; c.RemotePath = ""; c.Destination = "backup/" + Path.GetFileName(run);
+            c.RclonePath = (Environment.GetEnvironmentVariable("MAGICTRAY_TEST_RCLONE") ?? "rclone.exe");
+            c.Save();
+            string ftp = Path.Combine(Path.GetFullPath(args[2]), c.Destination.Replace('/', '\\'));
+            int stats = 0;
+            try
+            {
+                Assert(Config.Load(c.IniPath).Password == c.Password, "DPAPI round trip including Unicode and symbols");
+                Assert(!File.ReadAllText(c.IniPath).Contains(c.Password), "password not stored as plaintext");
+                Assert(Engine.Quote("D:\\space folder\\") == "\"D:\\space folder\\\\\"", "Windows trailing backslash argument escaping");
+                using (Engine engine = new Engine(app))
+                {
+                    Assert(!Engine.IsLowIntegrity(), "test process has normal desktop integrity");
+                    engine.Message += delegate(string line) { Console.WriteLine(line); };
+                    engine.Stats += delegate { Interlocked.Increment(ref stats); };
+                    engine.Test(c); Assert(true, "FTP authentication with Unicode/special-character password");
+                    File.WriteAllText(Path.Combine(source, "a.txt"), "AAAA");
+                    File.WriteAllText(Path.Combine(source, "中文 空格.txt"), "测试", new UTF8Encoding(false));
+                    File.WriteAllText(Path.Combine(source, "#literal.txt"), "literal");
+                    engine.Backup(c);
+                    Assert(File.ReadAllText(Path.Combine(ftp, "a.txt")) == "AAAA", "initial upload");
+                    Assert(File.ReadAllText(Path.Combine(ftp, "中文 空格.txt")) == "测试", "Unicode file names and spaces");
+                    Assert(File.Exists(Path.Combine(ftp, "#literal.txt")), "files-from-raw treats hash-prefixed name literally");
+                    Assert(stats > 0, "real rclone JSON statistics parsed");
+                    engine.Backup(c); Assert(engine.LastBackup.Contains("上传 0"), "unchanged files not reuploaded");
+                    string a = Path.Combine(source, "a.txt"); DateTime time = File.GetLastWriteTimeUtc(a);
+                    File.WriteAllText(a, "BBBB"); File.SetLastWriteTimeUtc(a, time);
+                    engine.Backup(c); Assert(File.ReadAllText(Path.Combine(ftp, "a.txt")) == "BBBB", "same-size same-time content change detected");
+                    string[] versions = Directory.GetFiles(ftp + "_versions", "a.txt", SearchOption.AllDirectories);
+                    Assert(versions.Length == 1 && File.ReadAllText(versions[0]) == "AAAA", "previous phone version preserved before overwrite");
+                    File.Delete(Path.Combine(ftp, "中文 空格.txt"));
+                    engine.Backup(c); Assert(File.Exists(Path.Combine(ftp, "中文 空格.txt")), "missing remote file repaired");
+                    File.Delete(a); engine.Backup(c);
+                    Assert(File.Exists(Path.Combine(ftp, "a.txt")), "local deletion preserves phone backup");
+                    File.WriteAllBytes(Path.Combine(source, "cancel.bin"), new byte[3 * 1024 * 1024]);
+                    Action<Dictionary<string, object>> cancel = delegate { engine.Cancel(); };
+                    engine.Stats += cancel;
+                    bool stopped = false; try { engine.Backup(c); } catch (OperationCanceledException) { stopped = true; }
+                    engine.Stats -= cancel; Assert(stopped && engine.LastBackup.Contains("已停止"), "cancellation never reports success");
+                    engine.ResetCancellation(); engine.Backup(c);
+                    Assert(new FileInfo(Path.Combine(ftp, "cancel.bin")).Length == 3 * 1024 * 1024, "cancelled transfer retried successfully");
+                    Config wrong = c.Snapshot(); wrong.Password = "wrong-password";
+                    bool rejected = false; try { engine.Test(wrong); } catch { rejected = true; }
+                    Assert(rejected, "incorrect password rejected");
+                    if (args.Length > 3 && args[3] == "backup-only") { Console.WriteLine("ALL PASSED: " + passed); return 0; }
+                    c.Drive = "";
+                    for (char letter = 'Z'; letter >= 'D'; letter--) if (!Engine.DriveOccupied(letter + ":")) { c.Drive = letter + ":"; break; }
+                    Assert(c.Drive.Length > 0, "free test drive available");
+                    try
+                    {
+                        engine.Mount(c);
+                        Assert(engine.HasMount && Engine.DriveOccupied(c.Drive), "WinFsp drive mounted");
+                        Assert(File.Exists(c.Drive + "\\" + c.Destination.Replace('/', '\\') + "\\a.txt"), "mounted FTP drive readable");
+                        string probeName = "mount-write-" + Guid.NewGuid().ToString("N") + "-中文.txt";
+                        string mountedProbe = c.Drive + "\\" + probeName;
+                        string serverProbe = Path.Combine(Path.GetFullPath(args[2]), probeName);
+                        string probeText = "Mounted FTP write-back verification: 中文 " + Guid.NewGuid();
+                        try
+                        {
+                            File.WriteAllText(mountedProbe, probeText, new UTF8Encoding(false));
+                            Assert(WaitUntil(delegate { return File.Exists(serverProbe) && File.ReadAllText(serverProbe) == probeText; }, 45), "mounted drive writes flushed to FTP server");
+                            Assert(File.ReadAllText(mountedProbe) == probeText, "mounted drive reads written content");
+                            File.Delete(mountedProbe);
+                            Assert(WaitUntil(delegate { return !File.Exists(serverProbe); }, 30), "mounted drive deletion reaches FTP server");
+                        }
+                        finally { if (File.Exists(serverProbe)) File.Delete(serverProbe); }
+                        using (Engine other = new Engine(Path.Combine(run, "other")))
+                        {
+                            bool conflict = false; try { other.Mount(c); } catch (Exception ex) { conflict = ex.Message.Contains("占用"); }
+                            Assert(conflict && !other.HasMount, "occupied drive never mistaken for owned mount");
+                            other.Unmount(); Assert(engine.HasMount, "unrelated tool instance cannot stop mount");
+                        }
+                        using (Engine restored = new Engine(app))
+                        {
+                            Assert(restored.MountMatches(c), "retained mount identified by PID/start time");
+                            restored.Unmount(); Assert(!restored.HasMount, "owned mount unmounted");
+                        }
+                    }
+                    finally { engine.Unmount(); }
+                    Assert(!File.ReadAllText(Path.Combine(app, "logs", "activity.log")).Contains(c.Password), "activity log contains no plaintext password");
+                }
+                Console.WriteLine("ALL PASSED: " + passed); return 0;
+            }
+            catch (Exception ex) { Console.WriteLine(ex); return 1; }
+        }
+    }
+}

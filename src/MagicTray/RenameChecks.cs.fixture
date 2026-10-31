@@ -1,0 +1,29 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Reflection;
+using MagicTray;
+internal static class RenameChecks {
+static int passed;
+static void Assert(bool value,string name){if(!value)throw new Exception(name);Console.WriteLine("PASS: "+name);passed++;}
+static int Main(string[] args){try {
+string root=Path.GetFullPath(args[0]);Directory.CreateDirectory(root);
+Config c=Config.Load(Path.Combine(root,"MagicTray.ini"));c.Host="192.0.2.10";c.Port=2121;c.User="example";c.Password="synthetic password";c.RemotePath="/Cloud/";c.Destination="/Backup/Example/";c.RclonePath=Path.GetFullPath(args[1]);
+Assert(c.Target=="magictray:Cloud"&&c.BackupTarget=="magictray:Cloud/Backup/Example","both FTP targets use the renamed remote including nested directories");
+using(Engine engine=new Engine(root)){
+MethodInfo start=typeof(Engine).GetMethod("StartInfo",BindingFlags.NonPublic|BindingFlags.Instance);
+Environment.SetEnvironmentVariable("RCLONE_CONFIG_MAGIC5_DESKTOP_HOST","synthetic inherited value");
+ProcessStartInfo login=(ProcessStartInfo)start.Invoke(engine,new object[]{c,new List<string>{"lsf",c.Target},true});
+Assert(login.EnvironmentVariables["RCLONE_CONFIG_MAGICTRAY_TYPE"]=="ftp"&&login.EnvironmentVariables["RCLONE_CONFIG_MAGICTRAY_HOST"]==c.Host&&login.EnvironmentVariables["RCLONE_CONFIG_MAGICTRAY_PORT"]=="2121"&&login.EnvironmentVariables["RCLONE_CONFIG_MAGICTRAY_USER"]==c.User,"StartInfo sets the complete RCLONE_CONFIG_MAGICTRAY credential environment");
+Assert(!string.IsNullOrEmpty(login.EnvironmentVariables["RCLONE_CONFIG_MAGICTRAY_PASS"])&&login.EnvironmentVariables["RCLONE_CONFIG_MAGICTRAY_PASS"]!=c.Password,"password is obscured for the child environment");
+Assert(!login.EnvironmentVariables.ContainsKey("RCLONE_CONFIG_MAGIC5_DESKTOP_HOST")&&login.EnvironmentVariables["RCLONE_CONFIG"]=="NUL","child remains isolated from inherited rclone remotes");
+Assert(login.Arguments.Contains(Engine.Quote(c.Target))&&!login.Arguments.Contains(c.Password),"login target matches environment and command line excludes plaintext password");
+ProcessStartInfo copy=(ProcessStartInfo)start.Invoke(engine,new object[]{c,new List<string>{"copy",Path.Combine(root,"example-source"),c.BackupTarget},true});
+Assert(copy.Arguments.Contains(Engine.Quote(c.BackupTarget))&&copy.EnvironmentVariables["RCLONE_CONFIG_MAGICTRAY_HOST"]==c.Host,"copy target uses the same renamed remote and credentials");
+}
+c.Save();string saved=File.ReadAllText(c.IniPath);Config reloaded=Config.Load(c.IniPath);
+Assert(saved.StartsWith("# MagicTray settings")&&!saved.Contains(c.Password)&&reloaded.Password==c.Password&&reloaded.Host==c.Host,"MagicTray settings save and reload using Windows password protection");
+Console.WriteLine("TOTAL: "+passed+" rename checks passed");return 0;
+}catch(Exception ex){Console.WriteLine(ex);return 1;}}
+}

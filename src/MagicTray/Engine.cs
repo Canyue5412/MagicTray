@@ -13,7 +13,7 @@ using System.Text.RegularExpressions;
 using System.Threading;
 using System.Web.Script.Serialization;
 
-namespace Magic5Tray
+namespace MagicTray
 {
     internal sealed class Engine : IDisposable
     {
@@ -26,6 +26,9 @@ namespace Magic5Tray
         private string mountIdentity = "", mountDrive = "";
         private volatile bool cancelled;
         public string LastBackup = "尚未运行备份";
+        public int LastUploaded { get; private set; }
+        public int LastPending { get; private set; }
+        public int LastProvisional { get; private set; }
         public int SkippedCount { get; private set; }
         public string SkippedReportPath { get { return Path.Combine(LogDir, "backup-skipped.txt"); } }
         private readonly List<string> skipped = new List<string>();
@@ -94,12 +97,11 @@ namespace Magic5Tray
             }
             List<string> paths = new List<string>(new string[] {
                 Path.Combine(Root, "tools", "rclone.exe"), Path.Combine(Root, "rclone.exe"),
-                @"D:\Tools\rclone\rclone-v1.75.2-windows-amd64\rclone.exe",
                 @"C:\Program Files\rclone\rclone.exe", @"C:\Program Files (x86)\rclone\rclone.exe" });
             foreach (string dir in (Environment.GetEnvironmentVariable("PATH") ?? "").Split(';'))
                 if (dir.Trim().Length > 0) try { paths.Add(Path.Combine(dir.Trim().Trim('"'), "rclone.exe")); } catch { }
             foreach (string path in paths) if (File.Exists(path)) return path;
-            throw new Exception("未找到 rclone.exe。请解压 packages 中的 rclone 安装包，然后在界面选择 rclone.exe。");
+            throw new Exception("未找到 rclone.exe。请从 rclone.org 下载并解压，在“FTP 连接”的高级设置中选择程序，或将它加入 PATH。");
         }
         private ProcessStartInfo StartInfo(Config c, IList<string> args, bool credentials)
         {
@@ -116,11 +118,12 @@ namespace Magic5Tray
             if (credentials)
             {
                 string obscure = Run(c, new string[] {"obscure", "-"}, 10000, false, c.Password + "\n", false).Trim();
-                psi.EnvironmentVariables["RCLONE_CONFIG_MAGIC5_DESKTOP_TYPE"] = "ftp";
-                psi.EnvironmentVariables["RCLONE_CONFIG_MAGIC5_DESKTOP_HOST"] = c.Host;
-                psi.EnvironmentVariables["RCLONE_CONFIG_MAGIC5_DESKTOP_PORT"] = c.Port.ToString();
-                psi.EnvironmentVariables["RCLONE_CONFIG_MAGIC5_DESKTOP_USER"] = c.User;
-                psi.EnvironmentVariables["RCLONE_CONFIG_MAGIC5_DESKTOP_PASS"] = obscure;
+                string prefix = "RCLONE_CONFIG_" + Config.RemoteName.ToUpperInvariant() + "_";
+                psi.EnvironmentVariables[prefix + "TYPE"] = "ftp";
+                psi.EnvironmentVariables[prefix + "HOST"] = c.Host;
+                psi.EnvironmentVariables[prefix + "PORT"] = c.Port.ToString();
+                psi.EnvironmentVariables[prefix + "USER"] = c.User;
+                psi.EnvironmentVariables[prefix + "PASS"] = obscure;
             }
             return psi;
         }
@@ -135,14 +138,57 @@ namespace Magic5Tray
         {
             public readonly bool PartialRenameDenied;
             public readonly List<string> FailedObjects;
+            public readonly List<string> LocalReadObjects;
+            public readonly List<string> SucceededObjects;
             public readonly int ReportedErrors;
             public readonly bool HasOtherErrors;
-            public RcloneFailure(int code, string details, bool partialRenameDenied, List<string> failedObjects, int reportedErrors, bool hasOtherErrors)
-                : base("rclone 失败（" + code + "）：" + details) { PartialRenameDenied = partialRenameDenied; FailedObjects = failedObjects; ReportedErrors = reportedErrors; HasOtherErrors = hasOtherErrors; }
+            public readonly bool Transient;
+            public RcloneFailure(int code, string details, bool partialRenameDenied, List<string> failedObjects, List<string> localReadObjects, List<string> succeededObjects, int reportedErrors, bool hasOtherErrors, bool transient)
+                : base("rclone 失败（" + code + "）：" + details)
+            {
+                PartialRenameDenied = partialRenameDenied; FailedObjects = failedObjects; LocalReadObjects = localReadObjects; SucceededObjects = succeededObjects;
+                ReportedErrors = reportedErrors; HasOtherErrors = hasOtherErrors; Transient = transient;
+            }
         }
-        private static string ErrorDetail(string line, out string failedObject, out int errorCount, out bool otherError)
+        private static bool IsTransientMessage(string text)
         {
-            failedObject = null; errorCount = 0; otherError = false;
+            string lower = text.ToLowerInvariant();
+            string[] markers = new string[] {
+                "connection", "eof", "broken pipe", "timeout", "timed out", "wsasend", "wsarecv",
+                "forcibly closed", "aborted", "421 ", "425 ", "426 ", "451 ", "temporary failure",
+                "i/o error", "network is unreachable", "connection reset", "no connection could be made",
+                "actively refused", "no such directory"
+            };
+            foreach (string marker in markers) if (lower.IndexOf(marker, StringComparison.Ordinal) >= 0) return true;
+            // A concurrent MKD race can surface as 550/553 "File exists"/"directory exists".
+            if ((lower.IndexOf("550", StringComparison.Ordinal) >= 0 || lower.IndexOf("553", StringComparison.Ordinal) >= 0) &&
+                (lower.IndexOf("directory", StringComparison.Ordinal) >= 0 || lower.IndexOf("mkdir", StringComparison.Ordinal) >= 0 || lower.IndexOf("exists", StringComparison.Ordinal) >= 0))
+                return true;
+            return false;
+        }
+        private static string SuccessObject(string line)
+        {
+            try
+            {
+                Dictionary<string, object> row = Json().Deserialize<Dictionary<string, object>>(line);
+                if (!row.ContainsKey("level") || Convert.ToString(row["level"]) != "info") return null;
+                string message = row.ContainsKey("msg") ? Convert.ToString(row["msg"]) : "";
+                if (message == null || !message.StartsWith("Copied", StringComparison.OrdinalIgnoreCase)) return null;
+                object failed;
+                return row.TryGetValue("object", out failed) ? Convert.ToString(failed) : null;
+            }
+            catch { return null; }
+        }
+        private static bool IsPartialRenameDenied(string detail)
+        {
+            // EOF/timeouts after RNTO are ordinary connection failures. Direct writes
+            // are justified only when the server explicitly rejects the rename.
+            return detail.IndexOf("partial file rename failed", StringComparison.OrdinalIgnoreCase) >= 0 &&
+                Regex.IsMatch(detail, @"\b55[03]\b");
+        }
+        private static string ErrorDetail(string line, out string failedObject, out int errorCount, out bool otherError, out bool transient, out bool localReadError)
+        {
+            failedObject = null; errorCount = 0; otherError = false; transient = false; localReadError = false;
             try
             {
                 Dictionary<string, object> row = Json().Deserialize<Dictionary<string, object>>(line);
@@ -157,19 +203,22 @@ namespace Magic5Tray
                 string detail = row.ContainsKey("msg") ? Convert.ToString(row["msg"]) : line;
                 Match aggregate = Regex.Match(detail, @"^Attempt \d+/\d+ failed with (\d+) errors? and:");
                 if (aggregate.Success) errorCount = int.Parse(aggregate.Groups[1].Value);
-                if (level == "error" && row.ContainsKey("object") &&
-                    (detail.IndexOf("failed to open source", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                     detail.IndexOf("failed to read source", StringComparison.OrdinalIgnoreCase) >= 0))
-                    failedObject = Convert.ToString(row["object"]);
                 if (level == "error" || level == "critical")
                 {
-                    if (row.ContainsKey("object")) otherError = failedObject == null;
-                    else if (!aggregate.Success && !detail.StartsWith("Failed to copy", StringComparison.OrdinalIgnoreCase)) otherError = true;
+                    // Keep every failed object, not only local read errors: an upload can fail
+                    // after the server has already stored the file (for example a dropped
+                    // control connection after RNTO), and those files must be retried/verified.
+                    if (row.ContainsKey("object")) failedObject = Convert.ToString(row["object"]);
+                    localReadError = failedObject != null &&
+                        (detail.IndexOf("failed to open source", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                         detail.IndexOf("failed to read source", StringComparison.OrdinalIgnoreCase) >= 0);
+                    if (!aggregate.Success && !detail.StartsWith("Failed to copy", StringComparison.OrdinalIgnoreCase) && !row.ContainsKey("object")) otherError = true;
                 }
                 if (row.ContainsKey("object")) detail = Convert.ToString(row["object"]) + " — " + detail;
+                transient = IsTransientMessage(detail);
                 return detail;
             }
-            catch { otherError = true; return line; }
+            catch { otherError = true; transient = IsTransientMessage(line); return line; }
         }
         private string Run(Config c, IList<string> args, int timeout, bool credentials, string input, bool progress)
         {
@@ -179,8 +228,8 @@ namespace Magic5Tray
             psi.StandardOutputEncoding = Encoding.UTF8; psi.StandardErrorEncoding = Encoding.UTF8;
             psi.RedirectStandardInput = input != null;
             StringBuilder output = new StringBuilder(), errors = new StringBuilder(); bool tooLarge = false, partialRenameDenied = false;
-            List<string> failedObjects = new List<string>();
-            int reportedErrors = 0; bool hasOtherErrors = false;
+            List<string> failedObjects = new List<string>(), localReadObjects = new List<string>(), succeededObjects = new List<string>();
+            int reportedErrors = 0; bool hasOtherErrors = false, transientError = false;
             using (Process p = new Process())
             {
                 p.StartInfo = psi;
@@ -192,21 +241,26 @@ namespace Magic5Tray
                 p.ErrorDataReceived += delegate(object sender, DataReceivedEventArgs e)
                 {
                     if (e.Data == null) return;
-                    string safe = Safe(e.Data, c);
-                    string failedObject; int errorCount; bool otherError;
-                    string detail = ErrorDetail(safe, out failedObject, out errorCount, out otherError);
+                    // Parse structured data before redaction. A valid password may
+                    // itself be a JSON key (for example "object") or part of a filename.
+                    string succeeded = SuccessObject(e.Data);
+                    string failedObject; int errorCount; bool otherError, transient, localRead;
+                    string detail = ErrorDetail(e.Data, out failedObject, out errorCount, out otherError, out transient, out localRead);
                     lock (errors)
                     {
+                        if (!string.IsNullOrEmpty(succeeded) && !succeededObjects.Contains(succeeded)) succeededObjects.Add(succeeded);
                         if (!string.IsNullOrEmpty(failedObject) && !failedObjects.Contains(failedObject)) failedObjects.Add(failedObject);
-                        reportedErrors = Math.Max(reportedErrors, errorCount); hasOtherErrors |= otherError;
-                        if (safe.IndexOf("partial file rename failed", StringComparison.OrdinalIgnoreCase) >= 0 && safe.Contains("553")) partialRenameDenied = true;
+                        if (localRead && !string.IsNullOrEmpty(failedObject) && !localReadObjects.Contains(failedObject)) localReadObjects.Add(failedObject);
+                        reportedErrors = Math.Max(reportedErrors, errorCount); hasOtherErrors |= otherError; transientError |= transient;
+                        if (detail != null && IsPartialRenameDenied(detail))
+                            partialRenameDenied = true;
                         if (!string.IsNullOrEmpty(detail))
                         {
-                            errors.AppendLine(detail);
+                            errors.AppendLine(Safe(detail, c));
                             if (errors.Length > 4000) errors.Remove(0, errors.Length - 4000);
                         }
                     }
-                    if (progress) OnProgress(safe);
+                    if (progress) OnProgress(e.Data, c);
                 };
                 lock (processLock) { CheckCancelled(); p.Start(); active = p; }
                 try
@@ -222,7 +276,7 @@ namespace Magic5Tray
                     p.WaitForExit(); // drain both asynchronous streams before examining the result
                     CheckCancelled();
                     if (tooLarge) throw new Exception("文件列表过大，请缩小备份文件夹范围。");
-                    if (p.ExitCode != 0) throw new RcloneFailure(p.ExitCode, errors.ToString().Trim(), partialRenameDenied, failedObjects, reportedErrors, hasOtherErrors);
+                    if (p.ExitCode != 0) throw new RcloneFailure(p.ExitCode, errors.ToString().Trim(), partialRenameDenied, failedObjects, localReadObjects, succeededObjects, reportedErrors, hasOtherErrors, transientError);
                     return output.ToString();
                 }
                 finally
@@ -232,7 +286,33 @@ namespace Magic5Tray
                 }
             }
         }
-        private void OnProgress(string line)
+        private void RunWithRetry(Config c, IList<string> args, int timeout, int attempts)
+        {
+            RunWithRetryCapture(c, args, timeout, attempts);
+        }
+        private string RunWithRetryCapture(Config c, IList<string> args, int timeout, int attempts)
+        {
+            for (int i = 0; ; i++)
+            {
+                try { return Run(c, args, timeout, true, null, false); }
+                catch (OperationCanceledException) { throw; }
+                catch (Exception ex)
+                {
+                    RcloneFailure failure = ex as RcloneFailure;
+                    string message = ex.Message.ToLowerInvariant();
+                    if (message.IndexOf("login incorrect", StringComparison.Ordinal) >= 0 ||
+                        message.IndexOf("authentication", StringComparison.Ordinal) >= 0 ||
+                        message.IndexOf("530 ", StringComparison.Ordinal) >= 0 ||
+                        message.IndexOf("invalid username", StringComparison.Ordinal) >= 0 ||
+                        message.IndexOf("password", StringComparison.Ordinal) >= 0) throw;
+                    bool retry = ex is TimeoutException || IsTransientMessage(ex.Message) || (failure != null && failure.Transient);
+                    if (!retry || i >= attempts - 1) throw;
+                    Say("手机 FTP 连接中断，2 秒后重试" + (i + 2) + "/" + attempts + "…");
+                    Thread.Sleep(2000);
+                }
+            }
+        }
+        private void OnProgress(string line, Config c)
         {
             try
             {
@@ -244,9 +324,9 @@ namespace Magic5Tray
                 }
                 string msg = row.ContainsKey("msg") ? Convert.ToString(row["msg"]) : line;
                 if (row.ContainsKey("object")) msg = Convert.ToString(row["object"]) + " — " + msg;
-                Say(msg);
+                Say(Safe(msg, c));
             }
-            catch { Say(line); }
+            catch { Say(Safe(line, c)); }
         }
         private static List<string> NetworkArgs(params string[] args)
         {
@@ -254,10 +334,18 @@ namespace Magic5Tray
             list.AddRange(new string[] {"--contimeout", "8s", "--timeout", "30s", "--ftp-idle-timeout", "30s", "--retries", "1", "--low-level-retries", "2"});
             return list;
         }
+        private static List<string> NetworkArgs(int ftpConcurrency, params string[] args)
+        {
+            List<string> list = NetworkArgs(args);
+            // FTPShare/Apache FtpServer accepts a limited number of control connections.
+            // Cap the pool so a large scan or a 2-4 way upload cannot exhaust it.
+            if (ftpConcurrency > 0) { list.Add("--ftp-concurrency"); list.Add(ftpConcurrency.ToString(CultureInfo.InvariantCulture)); }
+            return list;
+        }
         public void Test(Config c)
         {
             c.Validate(false);
-            Run(c, NetworkArgs("lsf", c.Target, "--max-depth", "1"), 45000, true, null, false);
+            RunWithRetry(c, NetworkArgs(2, "lsf", c.Target, "--max-depth", "1"), 45000, 3);
             Say("FTP 登录成功，手机目录可读取。");
         }
         public static bool DriveOccupied(string drive)
@@ -315,7 +403,7 @@ namespace Magic5Tray
         {
             c.Validate(false);
             if (IsLowIntegrity())
-                throw new Exception("当前程序以低完整性级别运行，Windows 禁止它创建盘符。请关闭工具，在普通 Windows PowerShell 中重新运行 src\\Magic5Tray\\build.ps1，修复成品文件的完整性标签；无需以管理员身份运行。");
+                throw new Exception("当前程序以低完整性级别运行，Windows 禁止它创建盘符。请关闭工具，在普通 Windows PowerShell 中重新运行 src\\MagicTray\\build.ps1，修复成品文件的完整性标签；无需以管理员身份运行。");
             if (HasMount)
             {
                 if (!MountMatches(c)) throw new Exception("已有其他配置的挂载，请先断开再更改连接设置。");
@@ -324,10 +412,10 @@ namespace Magic5Tray
             }
             if (DriveOccupied(c.Drive)) throw new Exception(c.Drive + " 已被占用（可能是旧版挂载），请选择其他盘符或先卸载旧盘。");
             if (!File.Exists(@"C:\Program Files (x86)\WinFsp\bin\winfsp-x64.dll") && !File.Exists(@"C:\Program Files\WinFsp\bin\winfsp-x64.dll"))
-                throw new Exception("尚未安装 WinFsp，请先运行 packages 中的 WinFsp 安装包。");
+                throw new Exception("尚未安装 WinFsp。请在“详细信息”页打开 WinFsp 官方下载链接，安装后再挂载。");
             Test(c);
             string cache = Path.Combine(LogDir, "cache"); Directory.CreateDirectory(cache);
-            string volume = "Magic5-" + Identity(c).Substring(0, 10) + "-" + c.Drive[0];
+            string volume = "MagicTray-" + Identity(c).Substring(0, 10) + "-" + c.Drive[0];
             List<string> args = NetworkArgs("mount", c.Target, c.Drive, "--network-mode", "--volname", volume,
                 "--vfs-cache-mode", "writes", "--cache-dir", cache, "--dir-cache-time", "10s", "--poll-interval", "0",
                 "--log-file", Path.Combine(LogDir, "mount.log"), "--log-level", "INFO");
@@ -416,7 +504,8 @@ namespace Magic5Tray
                 text.AppendLine("  原因：" + item.Substring(separator + 1));
                 text.AppendLine();
             }
-            Config.AtomicWrite(SkippedReportPath, text.ToString());
+            try { Config.AtomicWrite(SkippedReportPath, text.ToString()); }
+            catch (Exception ex) { Say("跳过报告写入失败（不影响已上传文件）：" + Safe(FirstLine(ex.Message), null)); }
         }
         public string ReadSkippedReport()
         {
@@ -474,32 +563,151 @@ namespace Magic5Tray
             }
             return files;
         }
-        private int RemoveDeniedSources(string source, RcloneFailure failure, Dictionary<string, string> snapshot, List<string> changed)
+        private int RemoveDeniedSources(string source, RcloneFailure failure, Dictionary<string, string> snapshot, List<string> pending)
         {
             int removed = 0;
-            foreach (string item in failure.FailedObjects)
+            HashSet<string> selected = new HashSet<string>(pending, StringComparer.Ordinal);
+            foreach (string item in failure.LocalReadObjects)
             {
                 // Only exact objects selected from this source are eligible. Remote errors
                 // alone are never permissions skips; the local read must also be denied now.
-                string relative = item.Replace('\\', '/');
-                if (!snapshot.ContainsKey(relative) || !changed.Contains(relative)) continue;
+                string relative = NormalizeObject(item);
+                if (!snapshot.ContainsKey(relative)) relative = NormalizeFailedObject(item);
+                if (!snapshot.ContainsKey(relative) || !selected.Contains(relative)) continue;
                 string path = Path.Combine(source, relative.Replace('/', '\\'));
                 try { using (Stream stream = OpenLocalRead(path)) { } }
                 catch (Exception ex)
                 {
                     if (!LocalPermissionDenied(ex)) continue;
                     Skip(path, "上传时本地读取权限被拒绝，重新检查确认无法读取");
-                    snapshot.Remove(relative); changed.Remove(relative); removed++;
+                    snapshot.Remove(relative); pending.Remove(relative); selected.Remove(relative); removed++;
                 }
             }
             return removed;
+        }
+        private static readonly Regex PartialSuffix = new Regex(@"\.[0-9a-fA-F]{8}(?:\.m[0-9a-fA-F]{6})?\.partial$|\.partial$", RegexOptions.Compiled);
+        private static bool OwnedPartial(string name, string suffix, Dictionary<string, string> snapshot)
+        {
+            // Do not infer ownership from the generic rclone .partial extension.
+            // Restrict cleanup to our source/target marker and a current source file.
+            if (snapshot.ContainsKey(name) || !name.EndsWith(suffix, StringComparison.Ordinal)) return false;
+            string stem = name.Substring(0, name.Length - suffix.Length);
+            Match hash = Regex.Match(stem, @"\.[0-9a-fA-F]{8}$");
+            return hash.Success && snapshot.ContainsKey(stem.Substring(0, hash.Index));
+        }
+        private static string NormalizeObject(string name)
+        {
+            if (string.IsNullOrEmpty(name)) return "";
+            name = name.Replace('\\', '/');
+            while (name.StartsWith("./", StringComparison.Ordinal)) name = name.Substring(2);
+            return name.TrimStart('/');
+        }
+        private static string NormalizeFailedObject(string name)
+        {
+            return PartialSuffix.Replace(NormalizeObject(name), "");
+        }
+        private static string FirstLine(string text)
+        {
+            if (string.IsNullOrEmpty(text)) return "";
+            int cut = text.IndexOfAny(new char[] { '\r', '\n' });
+            return (cut < 0 ? text : text.Substring(0, cut)).Trim();
+        }
+        private static List<string> FilterNames(IEnumerable<string> names, List<string> pending)
+        {
+            HashSet<string> allowed = new HashSet<string>(pending, StringComparer.Ordinal);
+            HashSet<string> seen = new HashSet<string>(StringComparer.Ordinal);
+            List<string> result = new List<string>();
+            foreach (string name in names)
+            {
+                string value = NormalizeObject(name);
+                if (!allowed.Contains(value)) value = NormalizeFailedObject(name);
+                if (value.Length > 0 && allowed.Contains(value) && seen.Add(value)) result.Add(value);
+            }
+            return result;
+        }
+        private static void MarkUploaded(IEnumerable<string> names, List<string> pending, HashSet<string> uploaded)
+        {
+            foreach (string name in names)
+            {
+                string value = NormalizeObject(name);
+                if (value.Length > 0) uploaded.Add(value);
+            }
+            pending.RemoveAll(delegate(string item) { return uploaded.Contains(item); });
+        }
+        private string EnsureBackupTarget(Config c)
+        {
+            // rclone mkdir may report 550 for a concurrent MKD race and can still exit 0
+            // with the directory absent. Verify with a listing and retry the pair.
+            Say("检查手机端已有备份…");
+            Exception last = null;
+            for (int i = 0; i < 3; i++)
+            {
+                try { Run(c, NetworkArgs(2, "mkdir", c.BackupTarget), 45000, true, null, false); }
+                catch (OperationCanceledException) { throw; }
+                catch (Exception ex) { last = ex; }
+                try
+                {
+                    return RunWithRetryCapture(c, NetworkArgs(2, "lsjson", c.BackupTarget, "--recursive", "--files-only", "--checkers", "1"), 300000, 2);
+                }
+                catch (OperationCanceledException) { throw; }
+                catch (Exception ex)
+                {
+                    last = ex;
+                    if (i < 2) { Say("手机端备份目录尚未就绪，正在重试…"); Thread.Sleep(1000); }
+                }
+            }
+            throw last;
+        }
+        private void CleanupPartialFiles(Config c, List<string> partials)
+        {
+            if (partials.Count == 0) return;
+            string file = Path.Combine(LogDir, "cleanup-partials-" + Guid.NewGuid().ToString("N") + ".txt");
+            try
+            {
+                File.WriteAllLines(file, partials.ToArray(), new UTF8Encoding(false));
+                Run(c, NetworkArgs(2, "delete", c.BackupTarget, "--files-from-raw", file, "--checkers", "1"), 300000, true, null, false);
+                Say("已清理手机端 " + partials.Count + " 个上传临时文件。");
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex) { Say("清理手机端临时文件失败（不影响本轮备份）：" + Safe(FirstLine(ex.Message), c)); }
+            finally { try { if (File.Exists(file)) File.Delete(file); } catch { } }
+        }
+        private bool ReconcileRemote(Config c, Dictionary<string, string> snapshot, List<string> pending, HashSet<string> uploaded, HashSet<string> provisional)
+        {
+            // Some FTP servers (notably Android/FTPShare under load) close the control
+            // connection after RNTO or return an error after the bytes were already stored.
+            // rclone then exits nonzero even though the object is complete. Trust the
+            // server's actual directory listing, not only the process exit code.
+            Dictionary<string, long> remote;
+            try
+            {
+                string listing = RunWithRetryCapture(c, NetworkArgs(2, "lsjson", c.BackupTarget, "--recursive", "--files-only", "--checkers", "1"), 600000, 3);
+                remote = new Dictionary<string, long>(StringComparer.Ordinal);
+                foreach (Dictionary<string, object> entry in Json().Deserialize<List<Dictionary<string, object>>>(listing))
+                    remote[NormalizeObject(Convert.ToString(entry["Path"]))] = Convert.ToInt64(entry["Size"]);
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex) { Say("无法核对手机端文件：" + Safe(ex.Message, c)); return false; }
+            int verified = 0;
+            for (int i = pending.Count - 1; i >= 0; i--)
+            {
+                string item = pending[i], value;
+                if (!snapshot.TryGetValue(item, out value)) { pending.RemoveAt(i); continue; }
+                long expected = long.Parse(value.Substring(0, value.IndexOf(':')), CultureInfo.InvariantCulture), size;
+                if (remote.TryGetValue(item, out size) && size == expected) { uploaded.Add(item); provisional.Add(item); pending.RemoveAt(i); verified++; }
+            }
+            if (verified > 0) Say("已核对手机端文件大小，确认 " + verified + " 个待传文件已写入。");
+            return pending.Count == 0;
         }
         public void Backup(Config c)
         {
             string listFile = Path.Combine(LogDir, "backup-files-" + Guid.NewGuid().ToString("N") + ".txt");
             bool reportStarted = false; string reportState = "备份失败";
+            Stopwatch totalClock = Stopwatch.StartNew(), phaseClock = new Stopwatch();
+            string phase = "准备";
             try
             {
+                LastUploaded = 0; LastPending = 0; LastProvisional = 0;
                 c.Validate(true);
                 string source = c.Source;
                 string app = Path.GetFullPath(Root).TrimEnd('\\') + "\\";
@@ -509,20 +717,31 @@ namespace Magic5Tray
                 skippedSource = source; skippedStarted = DateTime.Now; reportStarted = true;
                 SaveSkippedReport("正在运行");
                 Say("准备备份：" + source + " → " + c.BackupTarget);
-                Test(c);
+                phase = "FTP 连接"; phaseClock.Start(); Test(c);
+                Say("阶段耗时：FTP 连接 " + phaseClock.Elapsed.TotalSeconds.ToString("0.0", CultureInfo.InvariantCulture) + " 秒。");
+                phase = "本地摘要扫描"; phaseClock.Restart();
                 Say("扫描电脑文件内容，检测新增和修改…");
                 Dictionary<string, string> snapshot = Scan(source);
+                Say("阶段耗时：本地摘要扫描 " + phaseClock.Elapsed.TotalSeconds.ToString("0.0", CultureInfo.InvariantCulture) + " 秒；文件 " + snapshot.Count + " 个。");
+                phase = "手机清单检查"; phaseClock.Restart();
                 SaveSkippedReport("扫描完成，正在检查备份");
                 string key = Hash(Identity(c) + "\n" + source.ToUpperInvariant() + "\n" + c.Destination);
                 string manifest = Path.Combine(LogDir, "backup-manifest-" + key + ".json");
+                // rclone caps this suffix at 16 characters.
+                string partialSuffix = ".m" + key.Substring(0, 6).ToLowerInvariant() + ".partial";
                 Dictionary<string, string> previous = new Dictionary<string, string>();
                 if (File.Exists(manifest)) try { previous = Json().Deserialize<Dictionary<string, string>>(File.ReadAllText(manifest)); } catch { Say("上次扫描记录不可读，将重新上传全部源文件。"); }
-                Run(c, NetworkArgs("mkdir", c.BackupTarget), 45000, true, null, false);
-                Say("检查手机端已有备份…");
-                string listing = Run(c, NetworkArgs("lsjson", c.BackupTarget, "--recursive", "--files-only"), 300000, true, null, false);
+                string listing = EnsureBackupTarget(c);
                 Dictionary<string, long> remote = new Dictionary<string, long>(StringComparer.Ordinal);
+                List<string> stalePartials = new List<string>();
                 foreach (Dictionary<string, object> entry in Json().Deserialize<List<Dictionary<string, object>>>(listing))
-                    remote[Convert.ToString(entry["Path"])] = Convert.ToInt64(entry["Size"]);
+                {
+                    string raw = Convert.ToString(entry["Path"]);
+                    string path = NormalizeObject(raw);
+                    if (OwnedPartial(path, partialSuffix, snapshot)) { stalePartials.Add(path); continue; }
+                    remote[path] = Convert.ToInt64(entry["Size"]);
+                }
+                CleanupPartialFiles(c, stalePartials);
                 List<string> changed = new List<string>();
                 foreach (KeyValuePair<string, string> file in snapshot)
                 {
@@ -530,62 +749,149 @@ namespace Magic5Tray
                     long expected = long.Parse(file.Value.Substring(0, file.Value.IndexOf(':')), CultureInfo.InvariantCulture);
                     if (!previous.TryGetValue(file.Key, out old) || old != file.Value || !remote.TryGetValue(file.Key, out size) || size != expected) changed.Add(file.Key);
                 }
+                Say("阶段耗时：手机清单检查 " + phaseClock.Elapsed.TotalSeconds.ToString("0.0", CultureInfo.InvariantCulture) + " 秒。");
+                phase = "上传与重试"; phaseClock.Restart();
                 Say("本轮检查 " + snapshot.Count + " 个文件，需要上传 " + changed.Count + " 个。");
-                if (changed.Count > 0)
+                int changedTotal = changed.Count;
+                HashSet<string> changedSet = new HashSet<string>(changed, StringComparer.Ordinal);
+                HashSet<string> uploaded = new HashSet<string>(StringComparer.Ordinal);
+                HashSet<string> provisional = new HashSet<string>(StringComparer.Ordinal);
+                List<string> pending = new List<string>(changed);
+                string copyError = null; int deniedTotal = 0;
+                if (pending.Count > 0)
                 {
                     string versions = c.BackupTarget + "_versions/" + DateTime.Now.ToString("yyyyMMdd-HHmmss") + "-" + Guid.NewGuid().ToString("N").Substring(0, 8);
-                    bool direct = false; int attempt = 0;
-                    while (true)
+                    bool direct = false; int attempt = 0; List<string> retry = null;
+                    while (pending.Count > 0)
                     {
                         CheckCancelled();
-                        File.WriteAllLines(listFile, changed, new UTF8Encoding(false));
+                        List<string> batch = retry == null ? new List<string>(pending) : FilterNames(retry, pending);
+                        if (batch.Count == 0) batch = new List<string>(pending);
+                        retry = null;
+                        File.WriteAllLines(listFile, batch, new UTF8Encoding(false));
+                        int parallel = attempt == 0 ? c.BackupTransfers : 1;
                         string attemptVersions = versions + (attempt == 0 ? "" : "-retry-" + attempt) + (direct ? "-compat" : "");
-                        List<string> copyArgs = NetworkArgs("copy", source, c.BackupTarget, "--backup-dir", attemptVersions, "--files-from-raw", listFile, "--ignore-times",
-                            "--transfers", "1", "--checkers", "1", "--stats", "1s", "--stats-log-level", "INFO", "--use-json-log", "--log-level", "INFO");
+                        List<string> copyArgs = NetworkArgs(parallel * 2 + 1, "copy", source, c.BackupTarget, "--backup-dir", attemptVersions, "--files-from-raw", listFile, "--ignore-times",
+                            "--partial-suffix", partialSuffix, "--transfers", parallel.ToString(CultureInfo.InvariantCulture), "--checkers", parallel.ToString(CultureInfo.InvariantCulture), "--stats", "1s", "--stats-log-level", "INFO", "--use-json-log", "--log-level", "INFO");
                         if (direct) copyArgs.Add("--inplace");
-                        try { Run(c, copyArgs, 0, true, null, true); break; }
+                        try
+                        {
+                            Run(c, copyArgs, 0, true, null, true);
+                            MarkUploaded(batch, pending, uploaded);
+                            continue;
+                        }
+                        catch (OperationCanceledException) { throw; }
                         catch (RcloneFailure failure)
                         {
-                            int denied = RemoveDeniedSources(source, failure, snapshot, changed);
-                            bool useCompatibility = failure.PartialRenameDenied && !direct;
-                            if (changed.Count == 0)
+                            // rclone can exit nonzero after a file has already been stored (for
+                            // example a control connection dropped after RNTO). Count per-object
+                            // success first, then retry only the files that are actually missing.
+                            MarkUploaded(failure.SucceededObjects, pending, uploaded);
+                            int denied = RemoveDeniedSources(source, failure, snapshot, pending);
+                            deniedTotal += denied;
+                            if (pending.Count == 0)
                             {
-                                if (denied > 0 && denied == failure.FailedObjects.Count && denied == failure.ReportedErrors && !failure.HasOtherErrors)
-                                {
-                                    Say("所有待传文件均已确认本地读取权限被拒绝，已记入跳过清单。"); break;
-                                }
-                                throw;
+                                if (denied > 0) Say("所有待传文件均已确认本地读取权限被拒绝，已记入跳过清单。");
+                                else Say("rclone 报告了服务器错误，但本轮待传文件均已确认写入手机，按完成处理。");
+                                break;
                             }
-                            if (!useCompatibility && denied == 0) throw;
-                            if (useCompatibility)
+                            bool compatibility = failure.PartialRenameDenied && !direct;
+                            bool transient = failure.Transient;
+                            retry = FilterNames(failure.FailedObjects, pending);
+                            if (retry.Count == 0) retry = new List<string>(pending);
+                            if (denied > 0) Say("已跳过本地权限变更的 " + denied + " 个文件，继续备份其余可读文件。");
+                            if (compatibility)
                             {
                                 direct = true;
                                 Say("手机 FTP 拒绝临时文件改名，正在用直接写入兼容模式重试本轮文件；原有旧版本继续保留。");
                             }
-                            if (denied > 0) Say("已跳过本地权限变更的 " + denied + " 个文件，继续备份其余可读文件。");
-                            // Every retry uses its own directory to preserve original versions,
-                            // including files already uploaded successfully by an earlier try.
+                            if (!compatibility && !transient && denied == 0)
+                            {
+                                if (ReconcileRemote(c, snapshot, pending, uploaded, provisional)) { Say("服务器报告错误，但手机端文件核对一致，按完成处理。"); break; }
+                                copyError = Safe(FirstLine(failure.Message), c);
+                                break;
+                            }
                             attempt++;
+                            if (attempt > 3)
+                            {
+                                if (ReconcileRemote(c, snapshot, pending, uploaded, provisional)) { Say("服务器报告错误，但手机端文件核对一致，按完成处理。"); break; }
+                                copyError = Safe(FirstLine(failure.Message), c);
+                                break;
+                            }
+                            Say("服务器返回错误，正在降为单路上传并重试 " + retry.Count + " 个未完成文件…");
+                        }
+                        catch (Exception ex)
+                        {
+                            if (ReconcileRemote(c, snapshot, pending, uploaded, provisional)) { Say("上传被中断，但手机端文件核对一致，按完成处理。"); break; }
+                            copyError = Safe(FirstLine(ex.Message), c);
+                            break;
                         }
                     }
                 }
-                CheckCancelled();
-                // Persist the pre-transfer content snapshot: edits made during upload are picked up next time.
-                Config.AtomicWrite(manifest, Json().Serialize(snapshot));
-                reportState = SkippedCount == 0 ? "备份完成" : (snapshot.Count == 0 ? "未备份任何文件" : "备份完成，" + SkippedCount + " 项跳过（未备份）");
-                LastBackup = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "  " +
-                    (SkippedCount == 0 ? "备份成功" : (snapshot.Count == 0 ? "未备份任何文件，" + SkippedCount + " 项跳过（未备份）" : reportState)) +
-                    "：检查 " + snapshot.Count + "，上传 " + changed.Count + " 个文件。";
-                SaveResult(); Say(LastBackup);
+                int uploadedCount = 0;
+                foreach (string item in changedSet) if (uploaded.Contains(item)) uploadedCount++;
+                Say("阶段耗时：上传与重试 " + phaseClock.Elapsed.TotalSeconds.ToString("0.0", CultureInfo.InvariantCulture) + " 秒；上传并发 " + c.BackupTransfers + "。");
+                phase = "保存结果"; phaseClock.Restart();
+                // Persist confirmed progress, not only a fully successful round: a dropped
+                // phone FTP connection must not make the next run re-upload everything.
+                Dictionary<string, string> recorded = new Dictionary<string, string>(StringComparer.Ordinal);
+                int provisionalCount = 0;
+                foreach (KeyValuePair<string, string> file in snapshot)
+                {
+                    if (!changedSet.Contains(file.Key)) { recorded[file.Key] = file.Value; continue; }
+                    if (!uploaded.Contains(file.Key)) continue;
+                    if (provisional.Contains(file.Key)) { recorded[file.Key] = "?" + file.Value; provisionalCount++; }
+                    else recorded[file.Key] = file.Value;
+                }
+                LastUploaded = uploadedCount; LastPending = pending.Count; LastProvisional = provisionalCount;
+                // A wholly failed upload must not look like a successful scan next time.
+                if (uploadedCount > 0 || pending.Count == 0)
+                {
+                    try { Config.AtomicWrite(manifest, Json().Serialize(recorded)); }
+                    catch (Exception ex) { Say("本轮上传结果已确认，但本地扫描记录写入失败：" + Safe(FirstLine(ex.Message), c)); }
+                }
+                if (pending.Count > 0)
+                    throw new Exception("上传未完成：本轮 " + changedTotal + " 个待传文件中已确认 " + uploadedCount + " 个，剩余 " + pending.Count + " 个。" + (string.IsNullOrEmpty(copyError) ? "" : "服务器错误：" + copyError));
+                int expectedTotal = changedTotal - deniedTotal;
+                if (provisionalCount > 0)
+                {
+                    // Size-only confirmation cannot prove the content is current. Keep the
+                    // files in the manifest with a "?" marker so the next run retries them,
+                    // and tell the user instead of claiming a complete backup.
+                    reportState = "部分完成，" + provisionalCount + " 个文件仅核对大小，下轮重试";
+                    LastBackup = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "  部分完成" +
+                        (SkippedCount > 0 ? "（" + SkippedCount + " 项跳过）" : "") +
+                        "：检查 " + snapshot.Count + "，上传 " + uploadedCount + " / " + expectedTotal + " 个文件，其中 " + provisionalCount + " 个仅按手机端大小核对，下一轮会重新上传确认。";
+                }
+                else
+                {
+                    reportState = SkippedCount == 0 ? "备份完成" : (snapshot.Count == 0 ? "未备份任何文件" : "备份完成，" + SkippedCount + " 项跳过（未备份）");
+                    LastBackup = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "  " +
+                        (SkippedCount == 0 ? "备份成功" : (snapshot.Count == 0 ? "未备份任何文件，" + SkippedCount + " 项跳过（未备份）" : reportState)) +
+                        "：检查 " + snapshot.Count + "，上传 " + uploadedCount + " / " + expectedTotal + " 个文件。";
+                }
+                try { SaveResult(); } catch (Exception ex) { Say("备份已完成，但本地结果写入失败：" + Safe(FirstLine(ex.Message), c)); }
+                Say(LastBackup);
             }
             catch (Exception ex)
             {
-                reportState = ex is OperationCanceledException ? "已停止，扫描或上传未完成" : "备份失败，扫描或上传未完成";
-                LastBackup = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + (ex is OperationCanceledException ? "  已停止" : "  备份失败") + "：" + Safe(ex.Message, c);
+                bool partial = !(ex is OperationCanceledException) && LastUploaded > 0;
+                reportState = ex is OperationCanceledException ? "已停止，扫描或上传未完成" : (partial ? "部分完成，上传未全部完成" : "备份失败，扫描或上传未完成");
+                LastBackup = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + (ex is OperationCanceledException ? "  已停止" : (partial ? "  部分完成" : "  备份失败")) +
+                    (LastPending > 0 ? "：已上传 " + LastUploaded + " / " + (LastUploaded + LastPending) + "，剩余 " + LastPending + " 个；" : "：") + Safe(FirstLine(ex.Message), c);
                 if (reportStarted && SkippedCount > 0) LastBackup += "（另有 " + SkippedCount + " 项跳过，详见跳过项目）";
-                SaveResult(); throw;
+                try { SaveResult(); } catch (Exception save) { Say("备份结果已生成，但本地结果写入失败：" + Safe(FirstLine(save.Message), c)); }
+                throw;
             }
-            finally { if (File.Exists(listFile)) File.Delete(listFile); if (reportStarted) SaveSkippedReport(reportState); }
+            finally
+            {
+                if (File.Exists(listFile)) try { File.Delete(listFile); } catch { }
+                if (reportStarted)
+                {
+                    SaveSkippedReport(reportState);
+                    Say("本轮总耗时 " + totalClock.Elapsed.TotalSeconds.ToString("0.0", CultureInfo.InvariantCulture) + " 秒；结束阶段：" + phase + "；该阶段 " + phaseClock.Elapsed.TotalSeconds.ToString("0.0", CultureInfo.InvariantCulture) + " 秒。");
+                }
+            }
         }
         private void SaveResult() { Config.AtomicWrite(Path.Combine(LogDir, "backup-result.txt"), LastBackup); }
         public void Dispose() { Cancel(); if (mount != null) mount.Dispose(); }

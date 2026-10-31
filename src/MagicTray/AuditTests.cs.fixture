@@ -1,0 +1,86 @@
+// Synthetic regression checks for the 2.2.1 audit. No personal configuration.
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Reflection;
+using System.Text;
+using MagicTray;
+
+internal static class AuditTests
+{
+    static int passed;
+    static void Check(bool value, string message) { if (!value) throw new Exception("FAIL: " + message); Console.WriteLine("PASS: " + message); passed++; }
+    static object Call(string name, params object[] args) { return typeof(Engine).GetMethod(name, BindingFlags.NonPublic | BindingFlags.Static).Invoke(null, args); }
+    static int Main(string[] args)
+    {
+        string run = Path.GetFullPath(args[0]); Directory.CreateDirectory(run);
+        Console.SetOut(new StreamWriter(Path.Combine(run, "test-results.log"), false, new UTF8Encoding(false)) { AutoFlush = true });
+        try
+        {
+            Check(!(bool)Call("IsPartialRenameDenied", "partial file rename failed: EOF"), "rename EOF retains temporary-upload mode");
+            Check(!(bool)Call("IsPartialRenameDenied", "partial file rename failed: connection refused"), "connection refusal never enables direct writes");
+            Check((bool)Call("IsPartialRenameDenied", "partial file rename failed: 553 Can't rename file"), "explicit 553 rename rejection enables compatibility");
+            Check((bool)Call("IsPartialRenameDenied", "partial file rename failed: 550 File exists"), "explicit 550 rename rejection enables compatibility");
+            Check(!(bool)Call("IsPartialRenameDenied", "550 Synthetic upload permission denied"), "ordinary upload refusal does not enable compatibility");
+            List<string> pending = new List<string> { "report.partial", "data.txt" };
+            List<string> filtered = (List<string>)Call("FilterNames", new string[] { "report.partial", "data.txt.deadbeef.m123abc.partial" }, pending);
+            Check(filtered.Count == 2 && filtered.Contains("report.partial") && filtered.Contains("data.txt"), "retry matching preserves literal partial filenames and resolves app temporary names");
+            Dictionary<string, string> snapshot = new Dictionary<string, string> { { "data.txt", "4:hash" }, { "literal.deadbeef.m123abc.partial", "4:hash" } };
+            Check((bool)Call("OwnedPartial", "data.txt.deadbeef.m123abc.partial", ".m123abc.partial", snapshot), "cleanup accepts only marked temporaries for a current source");
+            foreach (string name in new string[] { "data.txt.deadbeef.partial", "data.txt.deadbeef.m999999.partial", "orphan.deadbeef.m123abc.partial", "literal.deadbeef.m123abc.partial" })
+                Check(!(bool)Call("OwnedPartial", name, ".m123abc.partial", snapshot), "cleanup preserves unowned or literal path: " + name);
+            string state = Path.Combine(run, "state.txt");
+            Config.AtomicWrite(state, "old"); Config.AtomicWrite(state, "new");
+            Check(File.ReadAllText(state) == "new", "state replacement publishes the complete new content");
+            bool refused = false;
+            using (FileStream locked = new FileStream(state, FileMode.Open, FileAccess.Read, FileShare.Read))
+                try { Config.AtomicWrite(state, "replacement"); } catch (IOException) { refused = true; } catch (UnauthorizedAccessException) { refused = true; }
+            Check(refused && File.ReadAllText(state) == "new", "failed replacement preserves the previous state");
+            Check(Directory.GetFiles(run, "*.tmp").Length == 0, "failed state writes clean their unique staging files");
+            // Windows junctions need no administrator token. The helper creates only
+            // a generated alias; deleting the alias below is nonrecursive.
+            string real = Path.Combine(run, "junction-target"), alias = Path.Combine(run, "junction-alias");
+            Directory.CreateDirectory(Path.Combine(real, "child"));
+            System.Diagnostics.ProcessStartInfo junction = new System.Diagnostics.ProcessStartInfo("powershell.exe", "-NoProfile -Command \"New-Item -ItemType Junction -Path '" + alias.Replace("'", "''") + "' -Target '" + real.Replace("'", "''") + "' | Out-Null\"") { UseShellExecute = false, CreateNoWindow = true };
+            using (System.Diagnostics.Process helper = System.Diagnostics.Process.Start(junction)) { helper.WaitForExit(); Check(helper.ExitCode == 0, "generated source junction created"); }
+            try
+            {
+                Config linked = new Config { Host = "127.0.0.1", User = "tester", Password = "synthetic", Source = Path.Combine(alias, "child") };
+                bool linkRefused = false; try { linked.Validate(true); } catch (Exception ex) { linkRefused = ex.Message.Contains("上级目录包含目录链接"); }
+                Check(linkRefused, "ancestor junction cannot bypass protected application directory exclusion");
+            }
+            finally { Directory.Delete(alias); }
+            if (args.Length > 2)
+            {
+                string source = Path.Combine(run, "source"), app = Path.Combine(run, "app"), ftp = Path.Combine(Path.GetFullPath(args[2]), "audit");
+                Directory.CreateDirectory(source); Directory.CreateDirectory(ftp);
+                File.WriteAllText(Path.Combine(source, "good.txt"), "GOOD");
+                File.WriteAllText(Path.Combine(source, "report.partial"), "literal source");
+                File.WriteAllText(Path.Combine(source, "remote-error.txt"), "DENIED");
+                File.WriteAllText(Path.Combine(ftp, "photo.deadbeef.partial"), "preserve remote data");
+                Config c = new Config { Host = "127.0.0.1", Port = int.Parse(args[1]), User = "keyword", Password = "object", Source = source, Destination = "audit", RemotePath = "", RclonePath = args[3] };
+                using (Engine e = new Engine(app))
+                {
+                    List<string> messages = new List<string>(); e.Message += delegate(string m) { messages.Add(m); Console.WriteLine(m); };
+                    bool failed = false; try { e.Backup(c); } catch { failed = true; }
+                    Check(failed && e.LastUploaded == 2 && e.LastPending == 1, "partial FTP refusal reports two confirmed uploads and one pending file");
+                    Check(e.LastProvisional == 0, "password equal to JSON object key cannot corrupt per-file success parsing");
+                    string manifest = Directory.GetFiles(e.LogDir, "backup-manifest-*.json")[0], recorded = File.ReadAllText(manifest);
+                    Check(recorded.Contains("good.txt") && recorded.Contains("report.partial") && !recorded.Contains("remote-error.txt"), "partial results persist only confirmed uploads");
+                    Check(File.ReadAllText(Path.Combine(ftp, "photo.deadbeef.partial")) == "preserve remote data", "backup preserves unrelated generic partial-named remote data");
+                    string key = (string)Call("Hash", (string)Call("Identity", c) + "\n" + c.Source.ToUpperInvariant() + "\n" + c.Destination);
+                    string suffix = ".m" + key.Substring(0, 6).ToLowerInvariant() + ".partial";
+                    string stale = Path.Combine(ftp, "good.txt.deadbeef" + suffix), foreign = Path.Combine(ftp, "orphan.deadbeef" + suffix);
+                    File.WriteAllText(stale, "stale owned upload"); File.WriteAllText(foreign, "preserve orphan");
+                    messages.Clear(); try { e.Backup(c); } catch { }
+                    Check(messages.Exists(delegate(string s) { return s.Contains("需要上传 1 个"); }), "next run retries only the unconfirmed file");
+                    Check(!File.Exists(stale) && File.ReadAllText(foreign) == "preserve orphan", "cleanup removes owned current-source temporary and retains unmatched marked file");
+                    Check(File.ReadAllText(Path.Combine(ftp, "report.partial")) == "literal source", "literal partial source survives subsequent backup and cleanup");
+                    Check(!Directory.Exists(ftp + "_versions"), "confirmed files are not uploaded or versioned again on the next round");
+                }
+            }
+            Console.WriteLine("ALL PASSED: " + passed); return 0;
+        }
+        catch (Exception ex) { Console.WriteLine(ex); return 1; }
+    }
+}

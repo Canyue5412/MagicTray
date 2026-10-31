@@ -1,7 +1,7 @@
 ﻿using System.Drawing;
 using System.Windows.Forms;
 
-namespace Magic5Tray
+namespace MagicTray
 {
     internal sealed class SkippedItemsForm : Form
     {
